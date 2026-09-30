@@ -1,636 +1,1155 @@
 // ============================================================
 // Cloudflare Worker – AI Chat with User Authentication & KV Storage
 // Bindings required: AI, KV, and secret JWT_SECRET
+// Optional binding: ALLOWED_ORIGINS (comma-separated list of extra origins
+// permitted to call the API cross-origin, e.g. a separate marketing site).
 // ============================================================
 
 export default {
-async fetch(request, env, ctx) {
-const url = new URL(request.url);
-const searchService = new SearchService(env);
+  async fetch(request, env, ctx) {
+    const response = await handleRequest(request, env, ctx);
+    return withResponseHardening(response, request, env);
+  }
+};
 
-// ---------- AUTH ENDPOINTS ----------
-if (url.pathname === "/api/signup" && request.method === "POST") {
-  return handleSignup(request, env);
+// ---------------------------------------------------------------------
+// Security headers + CORS, applied to every single response.
+// ---------------------------------------------------------------------
+function resolveAllowedOrigin(request, env) {
+  const origin = request.headers.get('Origin');
+  if (!origin) return null;
+  const selfOrigin = new URL(request.url).origin;
+  if (origin === selfOrigin) return origin;
+  const allowList = (env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
+  if (allowList.includes(origin)) return origin;
+  return null;
 }
-if (url.pathname === "/api/login" && request.method === "POST") {
-  return handleLogin(request, env);
+
+function withResponseHardening(response, request, env) {
+  const headers = new Headers(response.headers);
+
+  const allowedOrigin = resolveAllowedOrigin(request, env);
+  headers.delete('Access-Control-Allow-Origin');
+  if (allowedOrigin) {
+    headers.set('Access-Control-Allow-Origin', allowedOrigin);
+    headers.set('Vary', 'Origin');
+  }
+  headers.set('Access-Control-Allow-Methods', 'POST, GET, DELETE, PUT, OPTIONS');
+  headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+
+  headers.set('X-Content-Type-Options', 'nosniff');
+  headers.set('Referrer-Policy', 'strict-origin-when-cross-origin');
+  headers.set('X-Frame-Options', 'DENY');
+  headers.set('Strict-Transport-Security', 'max-age=63072000; includeSubDomains; preload');
+
+  // CSP updated to match every external resource actually loaded by the HTML:
+  //   - marked + DOMPurify  -> https://cdn.jsdelivr.net
+  //   - Font Awesome        -> https://cdnjs.cloudflare.com
+  //   - Google Fonts        -> https://fonts.googleapis.com + https://fonts.gstatic.com
+  headers.set('Content-Security-Policy',
+    "default-src 'self'; " +
+    "script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://cdn.jsdelivr.net; " +
+    "style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://fonts.googleapis.com; " +
+    "img-src 'self' data: blob:; " +
+    "font-src 'self' https://cdnjs.cloudflare.com https://fonts.gstatic.com data:; " +
+    "connect-src 'self'; " +
+    "frame-ancestors 'none'; " +
+    "base-uri 'self'; " +
+    "form-action 'self'"
+  );
+
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 }
 
-// ---------- PROTECTED ENDPOINTS ----------
-// All conversation & chat endpoints require a valid JWT
-const username = await authenticate(request, env);
-
-// Serve the main app HTML (always served, auth check happens client-side)
-if (url.pathname === "/" || url.pathname === "/chat") {
-  return new Response(HTML, {
-    headers: { "Content-Type": "text/html; charset=utf-8" },
+// ---------------------------------------------------------------------
+// Router helpers.
+// ---------------------------------------------------------------------
+function methodNotAllowed(allow) {
+  return new Response(JSON.stringify({ error: 'Method not allowed', allow }), {
+    status: 405,
+    headers: { 'Content-Type': 'application/json', 'Allow': allow.join(', ') },
   });
 }
 
-// ---------- CONVERSATIONS ----------
-if (url.pathname === "/api/conversations" && request.method === "GET") {
-  if (!username) return jsonResponse({ error: "Unauthorized" }, 401);
-  try {
-    const listKey = `user:${username}:convs`;
-    const listRaw = await env.KV.get(listKey, "json");
-    const conversations = listRaw || [];
-    return jsonResponse({ conversations });
-  } catch (err) {
-    return jsonResponse({ error: err.message }, 500);
-  }
+function jsonNotFound() {
+  return new Response(JSON.stringify({ error: 'Not found' }), {
+    status: 404,
+    headers: { 'Content-Type': 'application/json' },
+  });
 }
 
-if (url.pathname === "/api/conversations" && request.method === "POST") {
-  if (!username) return jsonResponse({ error: "Unauthorized" }, 401);
-  try {
-    const id = crypto.randomUUID();
-    const title = "New Chat";
-    const listKey = `user:${username}:convs`;
-    const listRaw = await env.KV.get(listKey, "json");
-    const conversations = listRaw || [];
-    conversations.unshift({ id, title, updated_at: Date.now() });
-    await env.KV.put(listKey, JSON.stringify(conversations));
-    await env.KV.put(`user:${username}:conv:${id}`, JSON.stringify([]));
-    indexConversation(searchService, username, { id, title, updated_at: Date.now() }).catch(() => {});
-    return jsonResponse({ id, title });
-  } catch (err) {
-    return jsonResponse({ error: err.message }, 500);
+async function handleRequest(request, env, ctx) {
+  const url = new URL(request.url);
+  const searchService = new SearchService(env);
+  const traceId = crypto.randomUUID();
+  const p = url.pathname;
+
+  // ---------- OPTIONS PREFLIGHT (before auth and routing) ----------
+  if (request.method === 'OPTIONS') {
+    return new Response(null, { status: 204 });
   }
-}
 
-if (url.pathname.startsWith("/api/conversations/") && request.method === "DELETE") {
-  if (!username) return jsonResponse({ error: "Unauthorized" }, 401);
-  const id = url.pathname.split("/").pop();
-  try {
-    const listKey = `user:${username}:convs`;
-    const listRaw = await env.KV.get(listKey, "json");
-    let conversations = listRaw || [];
-    conversations = conversations.filter(c => c.id !== id);
-    await env.KV.put(listKey, JSON.stringify(conversations));
-    await env.KV.delete(`user:${username}:conv:${id}`);
-    searchService.deleteIndex(`conv:${username}:${id}`).catch(() => {});
-    return jsonResponse({ success: true });
-  } catch (err) {
-    return jsonResponse({ error: err.message }, 500);
-  }
-}
-
-// ---------- MESSAGES ----------
-if (url.pathname === "/api/messages" && request.method === "GET") {
-  if (!username) return jsonResponse({ error: "Unauthorized" }, 401);
-  const conversationId = url.searchParams.get("conversationId");
-  if (!conversationId) return jsonResponse({ error: "Missing conversationId" }, 400);
-  try {
-    const messages = await env.KV.get(`user:${username}:conv:${conversationId}`, "json");
-    return jsonResponse({ messages: messages || [] });
-  } catch (err) {
-    return jsonResponse({ error: err.message }, 500);
-  }
-}
-
-if (url.pathname === "/api/chat/pending" && request.method === "GET") {
-  if (!username) return jsonResponse({ error: "Unauthorized" }, 401);
-  const conversationId = url.searchParams.get("conversationId");
-  if (!conversationId) return jsonResponse({ error: "Missing conversationId" }, 400);
-  try {
-    const pending = await env.KV.get(`user:${username}:conv:${conversationId}:pending`);
-    return jsonResponse({ pending: !!pending });
-  } catch (err) {
-    return jsonResponse({ error: err.message }, 500);
-  }
-}
-
-if (url.pathname === "/api/messages" && request.method === "PUT") {
-if (!username) return jsonResponse({ error: "Unauthorized" }, 401);
-  const { conversationId, messages } = await request.json();
-  if (!conversationId || !Array.isArray(messages)) return jsonResponse({ error: "Invalid payload" }, 400);
-  try {
-    await env.KV.put(`user:${username}:conv:${conversationId}`, JSON.stringify(messages));
-    const listKey = `user:${username}:convs`;
-    const listRaw = await env.KV.get(listKey, "json");
-    let conversations = listRaw || [];
-    const convIndex = conversations.findIndex(c => c.id === conversationId);
-    if (convIndex !== -1) {
-      conversations[convIndex].updated_at = Date.now();
-      await env.KV.put(listKey, JSON.stringify(conversations));
-      indexConversation(searchService, username, conversations[convIndex]).catch(() => {});
-    }
-    return jsonResponse({ success: true });
-  } catch (err) {
-    return jsonResponse({ error: err.message }, 500);
-  }
-}
-
-// ---------- MEMORY MANAGER ----------
-// Memories are stored per-user in KV as: user:<username>:memories -> [{ id, text, createdAt }]
-// and user:<username>:memory_settings -> { autoMemoryEnabled }
-if (url.pathname === "/api/memories" && request.method === "GET") {
-  if (!username) return jsonResponse({ error: "Unauthorized" }, 401);
-  try {
-    const memories = (await env.KV.get(`user:${username}:memories`, "json")) || [];
-    const settings = (await env.KV.get(`user:${username}:memory_settings`, "json")) || { autoMemoryEnabled: true };
-    return jsonResponse({ memories, autoMemoryEnabled: settings.autoMemoryEnabled !== false });
-  } catch (err) {
-    return jsonResponse({ error: err.message }, 500);
-  }
-}
-
-if (url.pathname === "/api/memories" && request.method === "POST") {
-  if (!username) return jsonResponse({ error: "Unauthorized" }, 401);
-  try {
-    const { text } = await request.json();
-    if (!text || !text.trim()) return jsonResponse({ error: "Memory text is required" }, 400);
-    const memories = (await env.KV.get(`user:${username}:memories`, "json")) || [];
-    const memory = { id: crypto.randomUUID(), text: text.trim(), createdAt: Date.now() };
-    memories.push(memory);
-    await env.KV.put(`user:${username}:memories`, JSON.stringify(memories));
-    indexMemory(searchService, username, memories).catch(() => {});
-    return jsonResponse({ memory });
-  } catch (err) {
-    return jsonResponse({ error: err.message }, 500);
-  }
-}
-
-if (url.pathname.startsWith("/api/memories/") && !url.pathname.startsWith("/api/memories/settings") && request.method === "PUT") {
-  if (!username) return jsonResponse({ error: "Unauthorized" }, 401);
-  const id = url.pathname.split("/").pop();
-  try {
-    const { text } = await request.json();
-    if (!text || !text.trim()) return jsonResponse({ error: "Memory text is required" }, 400);
-    const memories = (await env.KV.get(`user:${username}:memories`, "json")) || [];
-    const idx = memories.findIndex(m => m.id === id);
-    if (idx === -1) return jsonResponse({ error: "Memory not found" }, 404);
-    memories[idx].text = text.trim();
-    await env.KV.put(`user:${username}:memories`, JSON.stringify(memories));
-    indexMemory(searchService, username, memories).catch(() => {});
-    return jsonResponse({ success: true, memory: memories[idx] });
-  } catch (err) {
-    return jsonResponse({ error: err.message }, 500);
-  }
-}
-
-if (url.pathname.startsWith("/api/memories/") && !url.pathname.startsWith("/api/memories/settings") && request.method === "DELETE") {
-  if (!username) return jsonResponse({ error: "Unauthorized" }, 401);
-  const id = url.pathname.split("/").pop();
-  try {
-    let memories = (await env.KV.get(`user:${username}:memories`, "json")) || [];
-    memories = memories.filter(m => m.id !== id);
-    await env.KV.put(`user:${username}:memories`, JSON.stringify(memories));
-    indexMemory(searchService, username, memories).catch(() => {});
-    return jsonResponse({ success: true });
-  } catch (err) {
-    return jsonResponse({ error: err.message }, 500);
-  }
-}
-
-if (url.pathname === "/api/memories/settings" && request.method === "PUT") {
-  if (!username) return jsonResponse({ error: "Unauthorized" }, 401);
-  try {
-    const { autoMemoryEnabled } = await request.json();
-    await env.KV.put(`user:${username}:memory_settings`, JSON.stringify({ autoMemoryEnabled: !!autoMemoryEnabled }));
-    return jsonResponse({ success: true });
-  } catch (err) {
-    return jsonResponse({ error: err.message }, 500);
-  }
-}
-
-// ---------- SEARCH CONVERSATIONS ----------
-// Plain-text search across the user's conversation titles and message content.
-// Backed directly by KV (the same source of truth as everything else), so it
-// always reflects the latest state with no separate index to keep in sync.
-if (url.pathname === "/api/search" && request.method === "GET") {
-  if (!username) return jsonResponse({ error: "Unauthorized" }, 401);
-  const query = (url.searchParams.get("query") || "").trim();
-  if (!query) return jsonResponse({ results: [] });
-  try {
-    const conversations = (await env.KV.get(`user:${username}:convs`, "json")) || [];
-    const needle = query.toLowerCase();
-    const results = [];
-    for (const conv of conversations) {
-      const title = conv.title || "Session";
-      const titleMatch = title.toLowerCase().includes(needle);
-      let snippet = "";
-      let messageMatch = false;
-      const messages = (await env.KV.get(`user:${username}:conv:${conv.id}`, "json")) || [];
-      for (const m of messages) {
-        const content = m.content || "";
-        const idx = content.toLowerCase().indexOf(needle);
-        if (idx !== -1) {
-          messageMatch = true;
-          const start = Math.max(0, idx - 40);
-          const end = Math.min(content.length, idx + needle.length + 60);
-          snippet = (start > 0 ? "…" : "") + content.slice(start, end) + (end < content.length ? "…" : "");
-          break;
-        }
-      }
-      if (titleMatch || messageMatch) {
-        results.push({ conversationId: conv.id, title, snippet: snippet || title, titleMatch, updatedAt: conv.updated_at || 0 });
-      }
-    }
-    // Title matches first, then most-recently-updated within each group.
-    results.sort((a, b) => (b.titleMatch - a.titleMatch) || (b.updatedAt - a.updatedAt));
-    return jsonResponse({ results: results.slice(0, 15).map(({ conversationId, title, snippet }) => ({ conversationId, title, snippet })) });
-  } catch (err) {
-    console.error("Search error:", err);
-    return jsonResponse({ results: [], error: err.message });
-  }
-}
-
-// ---------- EXPORT CHAT ----------
-if (url.pathname === "/api/export" && request.method === "GET") {
-  if (!username) return jsonResponse({ error: "Unauthorized" }, 401);
-  const conversationId = url.searchParams.get("conversationId");
-  const format = (url.searchParams.get("format") || "markdown").toLowerCase();
-  if (!conversationId) return jsonResponse({ error: "Missing conversationId" }, 400);
-  try {
-    const messages = (await env.KV.get(`user:${username}:conv:${conversationId}`, "json")) || [];
-    const listRaw = (await env.KV.get(`user:${username}:convs`, "json")) || [];
-    const conv = listRaw.find(c => c.id === conversationId) || { id: conversationId, title: "Chat Export", updated_at: Date.now() };
-    return buildExportResponse(conv, messages, format);
-  } catch (err) {
-    return jsonResponse({ error: err.message }, 500);
-  }
-}
-
-// ---------- CHAT (STREAMING) ----------
-if (url.pathname === "/api/chat" && request.method === "POST") {
-  if (!username) return jsonResponse({ error: "Unauthorized" }, 401);
-  try {
-    // Rate limiting per user (using IP + username)
-    const ip = request.headers.get("CF-Connecting-IP") || "unknown";
-    const rlKey = `rl:${username}:${ip}`;
-    const now = Date.now();
-    const windowMs = 60000;
-    const maxRequests = 15;
-    let rlData = await env.KV.get(rlKey, "json");
-
-    if (!rlData || now > rlData.resetTime) {
-      rlData = { count: 1, resetTime: now + windowMs };
-      await env.KV.put(rlKey, JSON.stringify(rlData), { expirationTtl: 120 });
-    } else if (rlData.count >= maxRequests) {
-      return jsonResponse({ error: "Rate limit exceeded. Please wait a minute." }, 429);
-    } else {
-      rlData.count++;
-      await env.KV.put(rlKey, JSON.stringify(rlData), { expirationTtl: 120 });
-    }
-
-    const { message, conversationId, messages: frontendMessages, webSearchEnabled } = await request.json();
-    if (!conversationId) return jsonResponse({ error: "conversationId required" }, 400);
-
-    const hasImages = frontendMessages && frontendMessages.length > 0 && frontendMessages[frontendMessages.length - 1].images && frontendMessages[frontendMessages.length - 1].images.length > 0;
-
-    if (!message?.trim() && !hasImages) return jsonResponse({ error: "Message is required" }, 400);
-
-    // ---- EXPLICIT MEMORY DETECTION ----
-    // Check for explicit memory commands BEFORE running AI or memory extraction.
-    if (message && isExplicitMemoryRequest(message)) {
-      const memoryText = extractMemoryText(message);
-      if (memoryText && memoryText.length > 2 && memoryText.length < 500) {
-        // Save directly to KV
-        const memories = (await env.KV.get(`user:${username}:memories`, "json")) || [];
-        const newMemory = { id: crypto.randomUUID(), text: memoryText, createdAt: Date.now(), auto: false };
-        memories.push(newMemory);
-        await env.KV.put(`user:${username}:memories`, JSON.stringify(memories));
-
-        // Index to AI Search if available
-        indexMemory(searchService, username, memories).catch(() => {});
-
-        // Save user message and assistant acknowledgment to conversation
-        let messages = await env.KV.get(`user:${username}:conv:${conversationId}`, "json") || [];
-        messages.push({ role: "user", content: message, created_at: Date.now() });
-        messages.push({ role: "assistant", content: "I'll remember that. " + memoryText, created_at: Date.now() });
-        await env.KV.put(`user:${username}:conv:${conversationId}`, JSON.stringify(messages));
-
-        // Update conversation list (title, timestamp)
-        const listKey = `user:${username}:convs`;
-        const listRaw = await env.KV.get(listKey, "json") || [];
-        let conversations = listRaw;
-        const convIndex = conversations.findIndex(c => c.id === conversationId);
-        if (convIndex !== -1) {
-          if (conversations[convIndex].title === "New Chat" && messages.length === 2) {
-            conversations[convIndex].title = message.length > 40 ? message.slice(0, 40) + "..." : message;
-          }
-          conversations[convIndex].updated_at = Date.now();
-          await env.KV.put(listKey, JSON.stringify(conversations));
-          indexConversation(searchService, username, conversations[convIndex]).catch(() => {});
-        }
-
-        // Return SSE stream with the acknowledgment
-        const ackText = "I'll remember that.";
-        const sseData = `data: ${JSON.stringify({ response: ackText })}\n\ndata: [DONE]\n\n`;
-        return new Response(sseData, {
-          headers: {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "Access-Control-Allow-Origin": "*"
-          }
-        });
-      }
-    }
-
-    let messages;
-    if (Array.isArray(frontendMessages) && frontendMessages.length > 0 && frontendMessages[frontendMessages.length - 1].role === 'user') {
-      messages = frontendMessages;
-    } else {
-      messages = await env.KV.get(`user:${username}:conv:${conversationId}`, "json") || [];
-      messages.push({ role: "user", content: message, created_at: Date.now() });
-    }
-
-    const aiHistory = messages.slice(-8).map(m => {
-      if (m.images && m.images.length > 0) {
-        const contentArray = [];
-        if (m.content) {
-          contentArray.push({ type: 'text', text: m.content });
-        }
-        m.images.forEach(imgBase64 => {
-          contentArray.push({ type: 'image_url', image_url: { url: imgBase64 } });
-        });
-        return { role: m.role, content: contentArray };
-      }
-      return { role: m.role, content: m.content };
-    });
-
-    // ---- Long-term memory: inject what we remember about this user ----
-    const storedMemories = (await env.KV.get(`user:${username}:memories`, "json")) || [];
-    let systemPrompt = "You are a friendly, intelligent, and emotionally aware AI companion. You speak naturally like a close friend. You explain things clearly and deeply. You avoid robotic language and generic responses. You ask follow-up questions when appropriate. You are warm but honest. You never give short dismissive answers. You adapt your style to the user's mood and level of knowledge.";
-    if (storedMemories.length > 0) {
-      const memoryLines = storedMemories.map(m => `- ${m.text}`).join("\n");
-      systemPrompt += `\n\nHere is what you remember about this user from previous conversations. Use it naturally when relevant, without explicitly announcing that you are "recalling a memory":\n${memoryLines}`;
-    }
-
-    // ---- Web Search (Tavily) ----
-    // Only runs when the user has the Web Search toggle on. Never called when
-    // it's off, keeping the normal (non-search) chat path completely unchanged.
-    let webSearchNotice = null;
-    if (webSearchEnabled && message && message.trim()) {
-      const searchOutcome = await performWebSearch(env, message.trim());
-      if (searchOutcome.ok && searchOutcome.results.length > 0) {
-        const searchSystemMessage = buildWebSearchSystemMessage(searchOutcome.results);
-        if (searchSystemMessage) systemPrompt += `\n\n${searchSystemMessage}`;
-      } else if (!searchOutcome.ok) {
-        webSearchNotice = "Web search unavailable. Answering without search.";
-      } else {
-        webSearchNotice = "No relevant web results found. Answering without search.";
-      }
-    }
-
-    const aiMessages = [
-      { role: "system", content: systemPrompt },
-      ...aiHistory,
-    ];
-
-    // Mark this conversation as "generating" so the client can detect an
-    // in-progress reply (app closed/reopened, dropped connection, etc.)
-    // and wait for it instead of erroring out.
-    const pendingKey = `user:${username}:conv:${conversationId}:pending`;
-    await env.KV.put(pendingKey, JSON.stringify({ startedAt: Date.now() }), { expirationTtl: 300 });
-
-    const stream = await env.AI.run("@cf/meta/llama-4-scout-17b-16e-instruct", {
-      messages: aiMessages,
-      stream: true,
-      max_tokens: 1800,
-      temperature: 0.7
-    });
-
-    let fullReply = "";
-    const [rawClientStream, saveStream] = stream.tee();
-    
-    // If web search was on but failed (or returned nothing), let the client
-    // know via a small SSE event before the model's tokens start arriving,
-    // so the UI can show a graceful notice instead of failing silently.
-    let clientStream = rawClientStream;
-    if (webSearchNotice) {
-      const encoder = new TextEncoder();
-      const noticeChunk = encoder.encode(`data: ${JSON.stringify({ notice: webSearchNotice })}\n\n`);
-      clientStream = new ReadableStream({
-        async start(controller) {
-          controller.enqueue(noticeChunk);
-          const reader = rawClientStream.getReader();
-          try {
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) break;
-              controller.enqueue(value);
-            }
-            controller.close();
-          } catch (err) {
-            controller.error(err);
-          }
-        }
-      });
-    }
-
-    ctx.waitUntil((async () => {
+  // ---------- HEALTH (unauthenticated) ----------
+ if (p === '/api/health') {
+    if (request.method !== 'GET') return methodNotAllowed(['GET']);
+    const checks = { worker: true, kv: !!env.KV, ai: !!env.AI };
+    checks.search = !!(searchService && searchService.enabled);
+    // Deep check (actually exercises KV read/write) only runs when a secret
+    // is supplied, so casual/automated pings never cost a write.
+    const deepKey = url.searchParams.get('deep');
+    if (deepKey && env.HEALTH_CHECK_SECRET && deepKey === env.HEALTH_CHECK_SECRET) {
       try {
-        const reader = saveStream.getReader();
-        const decoder = new TextDecoder();
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          const chunk = decoder.decode(value, { stream: true });
-          const lines = chunk.split('\n');
-          for (const line of lines) {
-            if (line.startsWith('data: ')) {
+        const testKey = `__health_check__:${traceId}`;
+        await env.KV.put(testKey, '1', { expirationTtl: 30 });
+        checks.kvWrite = (await env.KV.get(testKey)) === '1';
+      } catch { checks.kvWrite = false; }
+    }
+    const healthy = checks.worker && checks.kv && checks.ai && checks.kvWrite !== false;
+    return jsonResponse({ status: healthy ? 'ok' : 'degraded', checks, traceId }, healthy ? 200 : 503);
+}
+
+  // ---------- AUTH ENDPOINTS (unauthenticated) ----------
+  if (p === '/api/signup') {
+    if (request.method !== 'POST') return methodNotAllowed(['POST']);
+    return handleSignup(request, env);
+  }
+  if (p === '/api/login') {
+    if (request.method !== 'POST') return methodNotAllowed(['POST']);
+    return handleLogin(request, env);
+  }
+
+  // ---------- PROTECTED ENDPOINTS ----------
+  const username = await authenticate(request, env);
+
+  // Serve the main app HTML (auth is checked client-side)
+  if (p === '/' || p === '/chat') {
+    if (request.method !== 'GET') return methodNotAllowed(['GET']);
+    return new Response(HTML, {
+      headers: { 'Content-Type': 'text/html; charset=utf-8' },
+    });
+  }
+
+  // ---------- REINDEX ----------
+  if (p === '/api/reindex') {
+    if (request.method !== 'POST') return methodNotAllowed(['POST']);
+    if (!username) return jsonResponse({ error: 'Unauthorized' }, 401);
+    if (!searchService || !searchService.enabled) {
+      return jsonResponse({ error: 'AI Search is not configured.' }, 501);
+    }
+    try {
+      const conversations = (await env.KV.get(`user:${username}:convs`, 'json')) || [];
+      let indexed = 0;
+      let failed = 0;
+      for (const conv of conversations) {
+        await indexConversation(searchService, username, conv);
+        const status = await env.KV.get(`index_status:conv:${username}:${conv.id}`, 'json');
+        if (status && status.status === 'failed') failed++; else indexed++;
+      }
+      const memories = (await env.KV.get(`user:${username}:memories`, 'json')) || [];
+      await indexMemory(searchService, username, memories);
+      const memStatus = await env.KV.get(`index_status:mem:${username}`, 'json');
+      return jsonResponse({
+        reindexed: indexed,
+        failed,
+        memoriesReindexed: !memStatus || memStatus.status !== 'failed',
+        total: conversations.length,
+      });
+    } catch (err) {
+      return jsonResponse({ error: err.message }, 500);
+    }
+  }
+
+  // ---------- ATTACHMENTS ----------
+  if (p.startsWith('/api/attachments/')) {
+    if (request.method !== 'GET') return methodNotAllowed(['GET']);
+    if (!username) return jsonResponse({ error: 'Unauthorized' }, 401);
+    if (!env.ATTACHMENTS) return jsonResponse({ error: 'Attachment storage is not configured.' }, 501);
+    const attachmentId = p.slice('/api/attachments/'.length);
+    const conversationId = url.searchParams.get('conversationId');
+    if (!attachmentId || !conversationId) return jsonResponse({ error: 'Missing attachment id or conversationId' }, 400);
+    const ownedConvs = (await env.KV.get(`user:${username}:convs`, 'json')) || [];
+    if (!ownedConvs.some(c => c.id === conversationId)) return jsonResponse({ error: 'Not found' }, 404);
+    try {
+      const obj = await env.ATTACHMENTS.get(attachmentR2Key(username, conversationId, attachmentId));
+      if (!obj) return jsonResponse({ error: 'Not found' }, 404);
+      return new Response(obj.body, {
+        headers: {
+          'Content-Type': (obj.httpMetadata && obj.httpMetadata.contentType) || 'application/octet-stream',
+          'Cache-Control': 'private, max-age=31536000, immutable',
+        },
+      });
+    } catch (err) {
+      return jsonResponse({ error: err.message }, 500);
+    }
+  }
+
+  // ---------- CONVERSATIONS ----------
+  if (p === '/api/conversations') {
+    if (request.method !== 'GET' && request.method !== 'POST') {
+      return methodNotAllowed(['GET', 'POST']);
+    }
+    if (!username) return jsonResponse({ error: 'Unauthorized' }, 401);
+    if (request.method === 'GET') {
+      try {
+        const listRaw = await env.KV.get(`user:${username}:convs`, 'json');
+        return jsonResponse({ conversations: listRaw || [] });
+      } catch (err) {
+        return jsonResponse({ error: err.message }, 500);
+      }
+    }
+    try {
+      const id = crypto.randomUUID();
+      const title = 'New Chat';
+      const listKey = `user:${username}:convs`;
+      const listRaw = await env.KV.get(listKey, 'json');
+      const conversations = listRaw || [];
+      conversations.unshift({ id, title, updated_at: Date.now() });
+      await env.KV.put(listKey, JSON.stringify(conversations));
+      await saveConversationMessages(env, username, id, [], { title });
+      indexConversation(searchService, username, { id, title, updated_at: Date.now() }).catch(() => {});
+      return jsonResponse({ id, title });
+    } catch (err) {
+      return jsonResponse({ error: err.message }, 500);
+    }
+  }
+
+  if (p.startsWith('/api/conversations/')) {
+    if (request.method !== 'DELETE') return methodNotAllowed(['DELETE']);
+    if (!username) return jsonResponse({ error: 'Unauthorized' }, 401);
+    const id = p.split('/').pop();
+    try {
+      const listKey = `user:${username}:convs`;
+      const listRaw = await env.KV.get(listKey, 'json');
+      let conversations = listRaw || [];
+      conversations = conversations.filter(c => c.id !== id);
+      await env.KV.put(listKey, JSON.stringify(conversations));
+      await deleteConversationMessages(env, username, id);
+      searchService.deleteIndex(`conv:${username}:${id}`).catch(() => {});
+      return jsonResponse({ success: true });
+    } catch (err) {
+      return jsonResponse({ error: err.message }, 500);
+    }
+  }
+
+  // ---------- MESSAGES ----------
+  if (p === '/api/messages') {
+    if (request.method !== 'GET' && request.method !== 'PUT') {
+      return methodNotAllowed(['GET', 'PUT']);
+    }
+    if (!username) return jsonResponse({ error: 'Unauthorized' }, 401);
+
+    if (request.method === 'GET') {
+      const conversationId = url.searchParams.get('conversationId');
+      if (!conversationId) return jsonResponse({ error: 'Missing conversationId' }, 400);
+      try {
+        const messages = await loadConversationMessages(env, username, conversationId);
+        return jsonResponse({ messages: messages || [] });
+      } catch (err) {
+        return jsonResponse({ error: err.message }, 500);
+      }
+    }
+
+    // PUT
+    let body;
+    try { body = await request.json(); } catch { return jsonResponse({ error: 'Invalid request body' }, 400); }
+    const { conversationId, messages } = body || {};
+    if (!conversationId || !Array.isArray(messages)) return jsonResponse({ error: 'Invalid payload' }, 400);
+    try {
+      await saveConversationMessages(env, username, conversationId, messages);
+      const listKey = `user:${username}:convs`;
+      const listRaw = await env.KV.get(listKey, 'json');
+      let conversations = listRaw || [];
+      const convIndex = conversations.findIndex(c => c.id === conversationId);
+      if (convIndex !== -1) {
+        conversations[convIndex].updated_at = Date.now();
+        await env.KV.put(listKey, JSON.stringify(conversations));
+        indexConversation(searchService, username, conversations[convIndex]).catch(() => {});
+      }
+      return jsonResponse({ success: true });
+    } catch (err) {
+      return jsonResponse({ error: err.message }, 500);
+    }
+  }
+
+  // ---------- CHAT PENDING ----------
+  if (p === '/api/chat/pending') {
+    if (request.method !== 'GET') return methodNotAllowed(['GET']);
+    if (!username) return jsonResponse({ error: 'Unauthorized' }, 401);
+    const conversationId = url.searchParams.get('conversationId');
+    if (!conversationId) return jsonResponse({ error: 'Missing conversationId' }, 400);
+    try {
+      const job = await env.KV.get(generationKey(username, conversationId), 'json');
+      const active = !!job && (job.status === 'queued' || job.status === 'running');
+      return jsonResponse({
+        pending: active,
+        generationId: job ? job.generationId : null,
+        status: job ? job.status : 'idle',
+        error: job && job.status === 'failed' ? job.error : undefined,
+      });
+    } catch (err) {
+      return jsonResponse({ error: err.message }, 500);
+    }
+  }
+
+  // ---------- CHAT CANCEL ----------
+  if (p === '/api/chat/cancel') {
+    if (request.method !== 'POST') return methodNotAllowed(['POST']);
+    if (!username) return jsonResponse({ error: 'Unauthorized' }, 401);
+    let body;
+    try { body = await request.json(); } catch { return jsonResponse({ error: 'Invalid request body' }, 400); }
+    const { conversationId, generationId } = body || {};
+    if (!conversationId) return jsonResponse({ error: 'Missing conversationId' }, 400);
+    try {
+      const job = await env.KV.get(generationKey(username, conversationId), 'json');
+      if (!job || (job.status !== 'queued' && job.status !== 'running')) {
+        return jsonResponse({ cancelled: false, reason: 'No active generation to cancel.' });
+      }
+      if (generationId && job.generationId !== generationId) {
+        return jsonResponse({ cancelled: false, reason: 'generationId does not match the active generation.' }, 409);
+      }
+      job.status = 'cancelled';
+      job.completedAt = Date.now();
+      await putGeneration(env, username, conversationId, job, 120);
+      return jsonResponse({ cancelled: true, generationId: job.generationId });
+    } catch (err) {
+      return jsonResponse({ error: err.message }, 500);
+    }
+  }
+
+  // ---------- MEMORIES ----------
+  if (p === '/api/memories') {
+    if (request.method !== 'GET' && request.method !== 'POST') {
+      return methodNotAllowed(['GET', 'POST']);
+    }
+    if (!username) return jsonResponse({ error: 'Unauthorized' }, 401);
+
+    if (request.method === 'GET') {
+      try {
+        const memories = (await env.KV.get(`user:${username}:memories`, 'json')) || [];
+        const settings = (await env.KV.get(`user:${username}:memory_settings`, 'json')) || { autoMemoryEnabled: true };
+        const withStatus = memories
+          .filter(m => m.status !== 'deleted')
+          .map(m => ({ ...m, status: memoryLifecycleStatus(m) }));
+        return jsonResponse({ memories: withStatus, autoMemoryEnabled: settings.autoMemoryEnabled !== false });
+      } catch (err) {
+        return jsonResponse({ error: err.message }, 500);
+      }
+    }
+
+    // POST
+    try {
+      const { text } = await request.json();
+      if (!text || !text.trim()) return jsonResponse({ error: 'Memory text is required' }, 400);
+      const memories = (await env.KV.get(`user:${username}:memories`, 'json')) || [];
+      const memory = { id: crypto.randomUUID(), text: text.trim(), source: 'manual', auto: false, confidence: 1.0, status: 'active', createdAt: Date.now(), updatedAt: Date.now(), lastUsedAt: null, useCount: 0 };
+      memories.push(memory);
+      await env.KV.put(`user:${username}:memories`, JSON.stringify(memories));
+      indexMemory(searchService, username, memories).catch(() => {});
+      return jsonResponse({ memory });
+    } catch (err) {
+      return jsonResponse({ error: err.message }, 500);
+    }
+  }
+
+  // ---------- MEMORY SETTINGS (must come before dynamic /api/memories/ route) ----------
+  if (p === '/api/memories/settings') {
+    if (request.method !== 'PUT') return methodNotAllowed(['PUT']);
+    if (!username) return jsonResponse({ error: 'Unauthorized' }, 401);
+    try {
+      const { autoMemoryEnabled } = await request.json();
+      await env.KV.put(`user:${username}:memory_settings`, JSON.stringify({ autoMemoryEnabled: !!autoMemoryEnabled }));
+      return jsonResponse({ success: true });
+    } catch (err) {
+      return jsonResponse({ error: err.message }, 500);
+    }
+  }
+
+// ---------- ACCOUNT DELETION ----------
+if (p === '/api/account') {
+    if (request.method !== 'DELETE') return methodNotAllowed(['DELETE']);
+    if (!username) return jsonResponse({ error: 'Unauthorized' }, 401);
+    try {
+      const conversations = (await env.KV.get(`user:${username}:convs`, 'json')) || [];
+      for (const conv of conversations) {
+        await deleteConversationMessages(env, username, conv.id);
+        searchService.deleteIndex(`conv:${username}:${conv.id}`).catch(() => {});
+      }
+      await Promise.all([
+        env.KV.delete(`user:${username}:convs`),
+        env.KV.delete(`user:${username}:memories`),
+        env.KV.delete(`user:${username}:memory_settings`),
+        env.KV.delete(`user:${username}`),
+      ]);
+      searchService.deleteIndex(`mem:${username}`).catch(() => {});
+      return jsonResponse({ success: true });
+    } catch (err) {
+      return jsonResponse({ error: err.message }, 500);
+    }
+}
+  // ---------- MEMORY BY ID ----------
+  if (p.startsWith('/api/memories/')) {
+    if (request.method !== 'PUT' && request.method !== 'DELETE') {
+      return methodNotAllowed(['PUT', 'DELETE']);
+    }
+    if (!username) return jsonResponse({ error: 'Unauthorized' }, 401);
+    const id = p.split('/').pop();
+
+    if (request.method === 'PUT') {
+      let body;
+      try { body = await request.json(); } catch { return jsonResponse({ error: 'Invalid request body' }, 400); }
+      const { text } = body || {};
+      if (!text || !text.trim()) return jsonResponse({ error: 'Memory text is required' }, 400);
+      try {
+        const memories = (await env.KV.get(`user:${username}:memories`, 'json')) || [];
+        const idx = memories.findIndex(m => m.id === id);
+        if (idx === -1) return jsonResponse({ error: 'Memory not found' }, 404);
+        memories[idx].text = text.trim();
+        memories[idx].updatedAt = Date.now();
+        memories[idx].status = 'active';
+        await env.KV.put(`user:${username}:memories`, JSON.stringify(memories));
+        indexMemory(searchService, username, memories).catch(() => {});
+        return jsonResponse({ success: true, memory: memories[idx] });
+      } catch (err) {
+        return jsonResponse({ error: err.message }, 500);
+      }
+    }
+
+    // DELETE
+    try {
+      let memories = (await env.KV.get(`user:${username}:memories`, 'json')) || [];
+      memories = memories.filter(m => m.id !== id);
+      await env.KV.put(`user:${username}:memories`, JSON.stringify(memories));
+      indexMemory(searchService, username, memories).catch(() => {});
+      return jsonResponse({ success: true });
+    } catch (err) {
+      return jsonResponse({ error: err.message }, 500);
+    }
+  }
+
+  // ---------- SEARCH ----------
+  if (p === '/api/search') {
+    if (request.method !== 'GET') return methodNotAllowed(['GET']);
+    if (!username) return jsonResponse({ error: 'Unauthorized' }, 401);
+    const query = (url.searchParams.get('query') || '').trim();
+    if (!query) return jsonResponse({ results: [] });
+    if (query.length > 200) return jsonResponse({ error: 'Search query is too long (max 200 characters).' }, 400);
+    try {
+      const conversations = (await env.KV.get(`user:${username}:convs`, 'json')) || [];
+      const needle = query.toLowerCase();
+      const results = [];
+      for (const conv of conversations) {
+        const title = conv.title || 'Session';
+        const titleMatch = title.toLowerCase().includes(needle);
+        let snippet = '';
+        let messageMatch = false;
+        const messages = await loadConversationMessages(env, username, conv.id);
+        for (const m of messages) {
+          const content = m.content || '';
+          const idx = content.toLowerCase().indexOf(needle);
+          if (idx !== -1) {
+            messageMatch = true;
+            const start = Math.max(0, idx - 40);
+            const end = Math.min(content.length, idx + needle.length + 60);
+            snippet = (start > 0 ? '…' : '') + content.slice(start, end) + (end < content.length ? '…' : '');
+            break;
+          }
+        }
+        if (titleMatch || messageMatch) {
+          results.push({ conversationId: conv.id, title, snippet: snippet || title, titleMatch, updatedAt: conv.updated_at || 0 });
+        }
+      }
+      results.sort((a, b) => (b.titleMatch - a.titleMatch) || (b.updatedAt - a.updatedAt));
+      return jsonResponse({ results: results.slice(0, 15).map(({ conversationId, title, snippet }) => ({ conversationId, title, snippet })) });
+    } catch (err) {
+      console.error('Search error:', err);
+      return jsonResponse({ results: [], error: err.message });
+    }
+  }
+
+  // ---------- EXPORT ----------
+  if (p === '/api/export') {
+    if (request.method !== 'GET') return methodNotAllowed(['GET']);
+    if (!username) return jsonResponse({ error: 'Unauthorized' }, 401);
+    const conversationId = url.searchParams.get('conversationId');
+    const format = (url.searchParams.get('format') || 'markdown').toLowerCase();
+    if (!conversationId) return jsonResponse({ error: 'Missing conversationId' }, 400);
+    try {
+      const messages = await loadConversationMessages(env, username, conversationId);
+      const listRaw = (await env.KV.get(`user:${username}:convs`, 'json')) || [];
+      const conv = listRaw.find(c => c.id === conversationId) || { id: conversationId, title: 'Chat Export', updated_at: Date.now() };
+      const MAX_EXPORT_MESSAGES = 2000;
+      let exportMessages = messages;
+      if (messages.length > MAX_EXPORT_MESSAGES) {
+        exportMessages = messages.slice(messages.length - MAX_EXPORT_MESSAGES);
+        exportMessages = [
+          { role: 'system', content: `[Export truncated: showing the most recent ${MAX_EXPORT_MESSAGES} of ${messages.length} messages]`, created_at: exportMessages[0]?.created_at },
+          ...exportMessages,
+        ];
+      }
+      exportMessages = await Promise.all(exportMessages.map(async m => {
+        if (!m.images || m.images.length === 0) return m;
+        const resolvedImages = (await Promise.all(
+          m.images.map(src => resolveImageForModel(env, username, src))
+        )).filter(Boolean);
+        return { ...m, images: resolvedImages };
+      }));
+      return buildExportResponse(conv, exportMessages, format);
+    } catch (err) {
+      return jsonResponse({ error: err.message }, 500);
+    }
+  }
+
+  // ---------- CHAT (STREAMING) ----------
+  if (p === '/api/chat') {
+    if (request.method !== 'POST') return methodNotAllowed(['POST']);
+    if (!username) return jsonResponse({ error: 'Unauthorized' }, 401);
+    try {
+      // Rate limit
+      const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+      const rlKey = `rl:${username}:${ip}`;
+      const now = Date.now();
+      const windowMs = 60000;
+      const maxRequests = 15;
+      let rlData = await env.KV.get(rlKey, 'json');
+      if (!rlData || now > rlData.resetTime) {
+        rlData = { count: 1, resetTime: now + windowMs };
+        await env.KV.put(rlKey, JSON.stringify(rlData), { expirationTtl: 120 });
+      } else if (rlData.count >= maxRequests) {
+        return jsonResponse({ error: 'Rate limit exceeded. Please wait a minute.' }, 429);
+      } else {
+        rlData.count++;
+        await env.KV.put(rlKey, JSON.stringify(rlData), { expirationTtl: 120 });
+      }
+
+      let body;
+      try { body = await request.json(); } catch { return jsonResponse({ error: 'Invalid request body' }, 400); }
+      const {
+        message,
+        conversationId,
+        messages: frontendMessages,
+        webSearchEnabled,
+        requestId,
+        continuation,
+      } = body || {};
+      if (!conversationId) return jsonResponse({ error: 'conversationId required' }, 400);
+
+      const ownedConvs = (await env.KV.get(`user:${username}:convs`, 'json')) || [];
+      if (!ownedConvs.some(c => c.id === conversationId)) {
+        return jsonResponse({ error: 'Conversation not found' }, 404);
+      }
+
+      const hasImages = frontendMessages && frontendMessages.length > 0 &&
+        frontendMessages[frontendMessages.length - 1].images &&
+        frontendMessages[frontendMessages.length - 1].images.length > 0;
+
+      if (!message?.trim() && !hasImages) return jsonResponse({ error: 'Message is required' }, 400);
+
+      if (message && message.length > 32000) {
+        return jsonResponse({ error: 'Message is too long (max 32,000 characters).' }, 400);
+      }
+
+      if (hasImages) {
+        const images = frontendMessages[frontendMessages.length - 1].images;
+        const imgValidation = validateImages(images);
+        if (!imgValidation.ok) return jsonResponse({ error: imgValidation.error }, 400);
+      }
+
+      // Stale-job-aware concurrency check
+      const existingJob = await getActiveGeneration(env, username, conversationId);
+      if (existingJob) {
+        const isDuplicate = !!(requestId && existingJob.requestId === requestId);
+        return jsonResponse({
+          error: isDuplicate ? 'This request is already generating.' : 'A response is already generating for this conversation.',
+          generationId: existingJob.generationId,
+          duplicate: isDuplicate,
+        }, 409);
+      }
+
+      // ---- EXPLICIT MEMORY DETECTION (only for non-continuation requests) ----
+      if (!continuation && message && isExplicitMemoryRequest(message)) {
+        const memoryText = extractMemoryText(message);
+        if (memoryText && memoryText.length > 2 && memoryText.length < 500) {
+          const memories = (await env.KV.get(`user:${username}:memories`, 'json')) || [];
+          const newMemory = { id: crypto.randomUUID(), text: memoryText, source: 'manual', auto: false, confidence: 1.0, status: 'active', createdAt: Date.now(), updatedAt: Date.now(), lastUsedAt: null, useCount: 0 };
+          memories.push(newMemory);
+          await env.KV.put(`user:${username}:memories`, JSON.stringify(memories));
+          indexMemory(searchService, username, memories).catch(() => {});
+
+          let messages = await loadConversationMessages(env, username, conversationId);
+          messages.push({ role: 'user', content: message, created_at: Date.now() });
+          messages.push({ role: 'assistant', content: "I'll remember that. " + memoryText, created_at: Date.now() });
+          await saveConversationMessages(env, username, conversationId, messages);
+
+          const listKey = `user:${username}:convs`;
+          const listRaw = await env.KV.get(listKey, 'json') || [];
+          let conversations = listRaw;
+          const convIndex = conversations.findIndex(c => c.id === conversationId);
+          if (convIndex !== -1) {
+            if (conversations[convIndex].title === 'New Chat' && messages.length === 2) {
+              conversations[convIndex].title = message.length > 40 ? message.slice(0, 40) + '...' : message;
+            }
+            conversations[convIndex].updated_at = Date.now();
+            await env.KV.put(listKey, JSON.stringify(conversations));
+            indexConversation(searchService, username, conversations[convIndex]).catch(() => {});
+          }
+
+          const ackText = "I'll remember that.";
+          const sseData = `data: ${JSON.stringify({ response: ackText })}\n\ndata: [DONE]\n\n`;
+          return new Response(sseData, {
+            headers: {
+              'Content-Type': 'text/event-stream',
+              'Cache-Control': 'no-cache',
+              'Connection': 'keep-alive',
+            }
+          });
+        }
+      }
+
+      // ---- Build message history ----
+      let messages;
+      if (continuation && Array.isArray(frontendMessages) && frontendMessages.length > 0) {
+        // Continuation: use the client's messages as-is. The continuation
+        // prompt itself is NOT saved as a user message.
+        messages = frontendMessages;
+      } else if (Array.isArray(frontendMessages) && frontendMessages.length > 0 && frontendMessages[frontendMessages.length - 1].role === 'user') {
+        messages = frontendMessages;
+      } else {
+        messages = await loadConversationMessages(env, username, conversationId);
+        messages.push({ role: 'user', content: message, created_at: Date.now() });
+      }
+
+      const aiHistory = await Promise.all(messages.slice(-8).map(async m => {
+        if (m.images && m.images.length > 0) {
+          const contentArray = [];
+          if (m.content) contentArray.push({ type: 'text', text: m.content });
+          for (const imgSrc of m.images) {
+            const resolved = await resolveImageForModel(env, username, imgSrc);
+            if (resolved) contentArray.push({ type: 'image_url', image_url: { url: resolved } });
+          }
+          return { role: m.role, content: contentArray };
+        }
+        return { role: m.role, content: m.content };
+      }));
+
+      if (hasImages && env.ATTACHMENTS && !continuation) {
+        const lastMsg = messages[messages.length - 1];
+        if (lastMsg && lastMsg.role === 'user' && Array.isArray(lastMsg.images)) {
+          const refs = await Promise.all(lastMsg.images.map(img => storeImageAttachment(env, username, conversationId, img)));
+          lastMsg.images = lastMsg.images.map((img, i) => refs[i] || img);
+        }
+      }
+
+      // ---- Memory injection ----
+      const allMemories = (await env.KV.get(`user:${username}:memories`, 'json')) || [];
+      const relevantMemories = selectRelevantMemories(allMemories, message || '');
+      let systemPrompt = "You are a friendly, intelligent, and emotionally aware AI companion. You speak naturally like a close friend. You explain things clearly and deeply. You avoid robotic language and generic responses. You ask follow-up questions when appropriate. You are warm but honest. You never give short dismissive answers. You adapt your style to the user's mood and level of knowledge.";
+      if (relevantMemories.length > 0) {
+        const memoryLines = relevantMemories.map(m => `- ${m.text}`).join('\n');
+        systemPrompt += `\n\nHere is what you remember about this user from previous conversations. Use it naturally when relevant, without explicitly announcing that you are "recalling a memory":\n${memoryLines}`;
+        ctx.waitUntil(touchMemoryUsage(env, username, relevantMemories.map(m => m.id)).catch(() => {}));
+      }
+
+      // ---- Web search ----
+      let webSearchNotice = null;
+      if (webSearchEnabled && message && message.trim() && !continuation) {
+        const searchOutcome = await performWebSearch(env, message.trim());
+        if (searchOutcome.ok && searchOutcome.results.length > 0) {
+          const searchSystemMessage = buildWebSearchSystemMessage(searchOutcome.results);
+          if (searchSystemMessage) systemPrompt += `\n\n${searchSystemMessage}`;
+        } else if (!searchOutcome.ok) {
+          webSearchNotice = 'Web search unavailable. Answering without search.';
+        } else {
+          webSearchNotice = 'No relevant web results found. Answering without search.';
+        }
+      }
+
+      const aiMessages = [
+        { role: 'system', content: systemPrompt },
+        ...aiHistory,
+      ];
+      // For continuation, add the continuation prompt to the AI's context
+      // but never persist it as a user message.
+      if (continuation && message) {
+        aiMessages.push({ role: 'user', content: message });
+      }
+
+      // ---- Create generation job ----
+      const generationId = crypto.randomUUID();
+      const generationJob = {
+        generationId,
+        conversationId,
+        userMessageId: message ? `${conversationId}:${messages.length - 1}` : null,
+        requestId: requestId || null,
+        status: 'running',
+        startedAt: Date.now(),
+        completedAt: null,
+        error: null,
+      };
+      await putGeneration(env, username, conversationId, generationJob);
+
+      const generationStartedAt = Date.now();
+      console.log(JSON.stringify({
+        event: 'generation_start', traceId, generationId, username, conversationId,
+        hasImages, webSearchEnabled: !!webSearchEnabled, continuation: !!continuation,
+      }));
+
+      // ---- Run AI with overall timeout + error handling ----
+      let stream;
+      const aiController = new AbortController();
+      const aiTimeoutId = setTimeout(() => aiController.abort(), 120000);
+      try {
+        stream = await env.AI.run('@cf/meta/llama-4-scout-17b-16e-instruct', {
+          messages: aiMessages,
+          stream: true,
+          max_tokens: 1800,
+          temperature: 0.7,
+        }, { signal: aiController.signal });
+        generationJob.completedAt = Date.now();
+        } catch (aiErr) {
+      clearTimeout(aiTimeoutId);
+      let friendlyMsg = String(aiErr && aiErr.message ? aiErr.message : aiErr);
+      if (/neuron|quota|rate.?limit|capacity/i.test(friendlyMsg)) {
+        friendlyMsg = "The free AI usage limit for today has been reached. Please try again later or tomorrow.";
+      }
+      generationJob.status = 'failed';
+      generationJob.error = friendlyMsg;
+        await putGeneration(env, username, conversationId, generationJob, 120).catch(() => {});
+        console.error(JSON.stringify({
+          event: 'generation_complete', traceId, generationId, username, conversationId,
+          status: 'failed', durationMs: Date.now() - generationStartedAt, error: generationJob.error,
+        }));
+        return jsonResponse({ error: generationJob.error }, 500);
+      }
+      clearTimeout(aiTimeoutId);
+
+      let fullReply = '';
+      const [rawClientStream, saveStream] = stream.tee();
+
+      // Wrap client stream to inject generationId + notice at the top.
+      let clientStream = rawClientStream;
+      {
+        const encoder = new TextEncoder();
+        const idChunk = encoder.encode(`data: ${JSON.stringify({ generationId })}\n\n`);
+        const noticeChunk = webSearchNotice ? encoder.encode(`data: ${JSON.stringify({ notice: webSearchNotice })}\n\n`) : null;
+        const innerStream = rawClientStream;
+        clientStream = new ReadableStream({
+          async start(controller) {
+            controller.enqueue(idChunk);
+            if (noticeChunk) controller.enqueue(noticeChunk);
+            const reader = innerStream.getReader();
+            try {
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                controller.enqueue(value);
+              }
+              controller.close();
+            } catch (err) {
+              controller.error(err);
+            }
+          }
+        });
+      }
+
+      // ---- Background save loop ----
+      ctx.waitUntil((async () => {
+        try {
+          const reader = saveStream.getReader();
+          const decoder = new TextDecoder();
+          let saveBuffer = ''; // carry-over buffer for partial SSE lines
+          let lastCancelCheck = Date.now();
+          let cancelled = false;
+
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            saveBuffer += decoder.decode(value, { stream: true });
+            const lines = saveBuffer.split('\n');
+            saveBuffer = lines.pop() || '';
+            for (const line of lines) {
+              if (!line.startsWith('data: ')) continue;
               const jsonStr = line.slice(6).trim();
               if (jsonStr === '[DONE]' || !jsonStr) continue;
               try {
                 const parsed = JSON.parse(jsonStr);
-                if (parsed.response) fullReply += parsed.response;
+                // Support both Workers AI flat {response} and OpenAI-style choices[0].delta.content
+                if (typeof parsed.response === 'string') {
+                  fullReply += parsed.response;
+                } else if (parsed.choices && parsed.choices[0]) {
+                  const delta = parsed.choices[0].delta;
+                  if (delta && typeof delta.content === 'string') {
+                    fullReply += delta.content;
+                  } else if (delta && typeof delta.content === 'number') {
+                    fullReply += String(delta.content);
+                  } else if (typeof parsed.choices[0].text === 'string') {
+                    fullReply += parsed.choices[0].text;
+                  }
+                }
               } catch (e) {}
             }
+            // Periodic cancellation check
+            if (Date.now() - lastCancelCheck > 750) {
+              lastCancelCheck = Date.now();
+              const liveJob = await env.KV.get(generationKey(username, conversationId), 'json').catch(() => null);
+              if (liveJob && liveJob.generationId === generationId && liveJob.status === 'cancelled') {
+                cancelled = true;
+                try { await reader.cancel(); } catch (e2) {}
+                break;
+              }
+            }
           }
-        }
-        messages.push({ role: "assistant", content: fullReply, created_at: Date.now() });
-        await env.KV.put(`user:${username}:conv:${conversationId}`, JSON.stringify(messages));
 
-        const listKey = `user:${username}:convs`;
-        const listRaw = await env.KV.get(listKey, "json") || [];
-        let conversations = listRaw;
-        const convIndex = conversations.findIndex(c => c.id === conversationId);
-        let convTitle = "New Chat";
-        if (convIndex !== -1) {
-          if (conversations[convIndex].title === "New Chat" && messages.length === 2) {
-            const newTitle = message.length > 40 ? message.slice(0, 40) + "…" : message;
-            conversations[convIndex].title = newTitle;
+          if (cancelled) {
+            console.log(JSON.stringify({
+              event: 'generation_complete', traceId, generationId, username, conversationId,
+              status: 'cancelled', durationMs: Date.now() - generationStartedAt,
+            }));
+            return;
           }
-          convTitle = conversations[convIndex].title;
-          conversations[convIndex].updated_at = Date.now();
-          await env.KV.put(listKey, JSON.stringify(conversations));
+
+          // Empty reply → treat as failure
+          if (!fullReply || !fullReply.trim()) {
+            generationJob.status = 'failed';
+            generationJob.error = 'The model returned an empty response.';
+            generationJob.completedAt = Date.now();
+            await putGeneration(env, username, conversationId, generationJob, 120).catch(() => {});
+            console.error(JSON.stringify({
+              event: 'generation_complete', traceId, generationId, username, conversationId,
+              status: 'failed', durationMs: Date.now() - generationStartedAt, error: generationJob.error,
+            }));
+            return;
+          }
+
+          // Build the final message list. For continuation, combine the
+          // partial assistant message with the new tokens.
+          if (continuation && messages.length > 0 && messages[messages.length - 1].role === 'assistant') {
+            const prev = messages[messages.length - 1];
+            messages[messages.length - 1] = {
+              ...prev,
+              content: (prev.content || '') + fullReply,
+              generationId,
+            };
+          } else {
+            messages.push({ role: 'assistant', content: fullReply, created_at: Date.now(), generationId });
+          }
+
+          await saveConversationMessages(env, username, conversationId, messages, { lastGenerationId: generationId });
+
+          const listKey = `user:${username}:convs`;
+          const listRaw = await env.KV.get(listKey, 'json') || [];
+          let conversations = listRaw;
+          const convIndex = conversations.findIndex(c => c.id === conversationId);
+          let convTitle = 'New Chat';
+          if (convIndex !== -1) {
+            if (conversations[convIndex].title === 'New Chat' && messages.length === 2 && message) {
+              const newTitle = message.length > 40 ? message.slice(0, 40) + '…' : message;
+              conversations[convIndex].title = newTitle;
+            }
+            convTitle = conversations[convIndex].title;
+            conversations[convIndex].updated_at = Date.now();
+            await env.KV.put(listKey, JSON.stringify(conversations));
+          }
+
+          const memSettings = (await env.KV.get(`user:${username}:memory_settings`, 'json')) || { autoMemoryEnabled: true };
+          if (memSettings.autoMemoryEnabled !== false && message && fullReply && !continuation) {
+            await new Promise(resolve => setTimeout(resolve, 100));
+            await extractAndSaveMemories(env, username, message, fullReply).catch(err => console.error('Memory extraction error:', err));
+            indexConversation(searchService, username, { id: conversationId, title: convTitle, updated_at: Date.now() }).catch(() => {});
+          } else {
+            indexConversation(searchService, username, { id: conversationId, title: convTitle, updated_at: Date.now() }).catch(() => {});
+          }
+
+          generationJob.status = 'completed';
+          generationJob.completedAt = Date.now();
+          await putGeneration(env, username, conversationId, generationJob, 120);
+          console.log(JSON.stringify({
+            event: 'generation_complete', traceId, generationId, username, conversationId,
+            status: 'completed', durationMs: Date.now() - generationStartedAt,
+          }));
+        } catch (err) {
+          console.error('Stream save error:', err);
+          generationJob.status = 'failed';
+          generationJob.error = String(err && err.message ? err.message : err);
+          generationJob.completedAt = Date.now();
+          await putGeneration(env, username, conversationId, generationJob, 120).catch(() => {});
+          console.log(JSON.stringify({
+            event: 'generation_complete', traceId, generationId, username, conversationId,
+            status: 'failed', durationMs: Date.now() - generationStartedAt,
+          }));
         }
+      })());
 
-        // Automatic long-term memory extraction (unless the user has disabled it).
-        // Run AFTER the stream is fully consumed and messages are saved.
-        const memSettings = (await env.KV.get(`user:${username}:memory_settings`, "json")) || { autoMemoryEnabled: true };
-        if (memSettings.autoMemoryEnabled !== false && message && fullReply) {
-          // Small delay to ensure KV writes are settled before extraction
-          await new Promise(resolve => setTimeout(resolve, 100));
-          await extractAndSaveMemories(env, username, message, fullReply).catch(err => console.error("Memory extraction error:", err));
-          // Re-index conversations after memory extraction
-          indexConversation(searchService, username, { id: conversationId, title: convTitle, updated_at: Date.now() }).catch(() => {});
-        } else {
-          // Index conversation even without memory extraction
-          indexConversation(searchService, username, { id: conversationId, title: convTitle, updated_at: Date.now() }).catch(() => {});
+      return new Response(clientStream, {
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
         }
-      } catch (err) {
-        console.error("Stream save error:", err);
-      } finally {
-        await env.KV.delete(pendingKey).catch(() => {});
-      }
-    })());
-
-    return new Response(clientStream, {
-      headers: {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-        "Access-Control-Allow-Origin": "*"
-      }
-    });
-  } catch (err) {
-    console.error(err);
-    return jsonResponse({ error: err.message }, 500);
-  }
-}
-
-// ---------- AI SEARCH CHAT ----------
-if (url.pathname === "/api/search-ai" && request.method === "POST") {
-  if (!username) return jsonResponse({ error: "Unauthorized" }, 401);
-  if (!searchService || !searchService.enabled) {
-    return jsonResponse({ error: "AI Search is not configured. Add AI_SEARCH or MY_SEARCH binding." }, 501);
-  }
-  try {
-    const { query } = await request.json();
-    if (!query || !query.trim()) return jsonResponse({ error: "Query is required" }, 400);
-
-    // First, get search results
-    const searchResults = await searchService.search(query, { limit: 10 });
-    const results = searchResults.results || searchResults.hits || [];
-
-    // Build context from search results
-    let context = "Based on the user's conversation history, here are relevant excerpts:\n\n";
-    if (results.length > 0) {
-      results.forEach((r, i) => {
-        const data = r.data || r;
-        context += `[Conversation ${i + 1}: ${data.title || 'Untitled'}]\n`;
-        if (data.userMessages) context += `User: ${data.userMessages.slice(0, 1000)}\n`;
-        if (data.assistantMessages) context += `Assistant: ${data.assistantMessages.slice(0, 1000)}\n`;
-        if (data.memories) context += `Memories: ${data.memories.slice(0, 500)}\n`;
-        context += '\n';
       });
-    } else {
-      context += "No relevant conversations found.\n";
+    } catch (err) {
+      console.error(err);
+      return jsonResponse({ error: err.message }, 500);
     }
+  }
 
-    // Try AI Search chat completions
-    const chatResult = await searchService.chat([
-      { role: "system", content: "You are a helpful assistant that answers questions about the user's past conversations. Use the provided context to give accurate, helpful answers. Be concise and natural." },
-      { role: "user", content: `Context from conversations:\n${context}\n\nUser question: ${query}` }
-    ]);
+  // ---------- AI SEARCH CHAT ----------
+  if (p === '/api/search-ai') {
+    if (request.method !== 'POST') return methodNotAllowed(['POST']);
+    if (!username) return jsonResponse({ error: 'Unauthorized' }, 401);
+    if (!searchService || !searchService.enabled) {
+      return jsonResponse({ error: 'AI Search is not configured. Add AI_SEARCH or MY_SEARCH binding.' }, 501);
+    }
+    try {
+      const { query } = await request.json();
+      if (!query || !query.trim()) return jsonResponse({ error: 'Query is required' }, 400);
+      if (query.length > 200) return jsonResponse({ error: 'Search query is too long (max 200 characters).' }, 400);
 
-    if (chatResult && chatResult.choices && chatResult.choices[0]) {
+      const searchResults = await searchService.search(query, {
+        limit: 10,
+        filter: { username },
+        idPrefix: `conv:${username}:`,
+      });
+      let results = searchResults.results || searchResults.hits || [];
+      results = results.filter(r => {
+        const data = r.data || r;
+        return data && data.username === username;
+      });
+
+      const allMemories = (await env.KV.get(`user:${username}:memories`, 'json')) || [];
+      const relevantMemories = selectRelevantMemories(allMemories, query);
+
+      let context = "Based on the user's conversation history, here are relevant excerpts:\n\n";
+      if (results.length > 0) {
+        results.forEach((r, i) => {
+          const data = r.data || r;
+          context += `[Conversation ${i + 1}: ${data.title || 'Untitled'}]\n`;
+          if (data.userMessages) context += `User: ${data.userMessages.slice(0, 1000)}\n`;
+          if (data.assistantMessages) context += `Assistant: ${data.assistantMessages.slice(0, 1000)}\n`;
+          context += '\n';
+        });
+      } else {
+        context += "No relevant conversations found.\n";
+      }
+      if (relevantMemories.length > 0) {
+        context += `\nWhat's remembered about this user:\n${relevantMemories.map(m => `- ${m.text}`).join('\n')}\n`;
+      }
+
+      const chatResult = await searchService.chat([
+        { role: 'system', content: 'You are a helpful assistant that answers questions about the user\'s past conversations. Use the provided context to give accurate, helpful answers. Be concise and natural.' },
+        { role: 'user', content: `Context from conversations:\n${context}\n\nUser question: ${query}` }
+      ]);
+
+      if (chatResult && chatResult.choices && chatResult.choices[0]) {
+        return jsonResponse({
+          answer: chatResult.choices[0].message?.content || chatResult.choices[0].text || '',
+          sources: results.map(r => {
+            const data = r.data || r;
+            return { conversationId: data.conversationId, title: data.title, snippet: (data.userMessages || '').slice(0, 200) };
+          })
+        });
+      }
+
       return jsonResponse({
-        answer: chatResult.choices[0].message?.content || chatResult.choices[0].text || "",
+        answer: null,
         sources: results.map(r => {
           const data = r.data || r;
           return { conversationId: data.conversationId, title: data.title, snippet: (data.userMessages || '').slice(0, 200) };
         })
       });
+    } catch (err) {
+      console.error('AI Search chat error:', err);
+      return jsonResponse({ error: err.message }, 500);
     }
-
-    // Fallback: return raw search results
-    return jsonResponse({
-      answer: null,
-      sources: results.map(r => {
-        const data = r.data || r;
-        return { conversationId: data.conversationId, title: data.title, snippet: (data.userMessages || '').slice(0, 200) };
-      })
-    });
-  } catch (err) {
-    console.error("AI Search chat error:", err);
-    return jsonResponse({ error: err.message }, 500);
   }
-}
 
-// ---------- CORS & FALLBACK ----------
-if (request.method === "OPTIONS") {
-  return new Response(null, {
-    headers: {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "POST, GET, DELETE, PUT, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
-    },
-  });
+  // ---------- JSON 404 for unknown paths ----------
+  return jsonNotFound();
 }
-
-return new Response("Not found", { status: 404 });
-},
-};
 
 // ===================== HELPER FUNCTIONS =====================
 
-// ---- Long-term memory extraction ----
-// After every AI reply, ask the model (a cheap, fast call) to pull out any
-// durable facts about the user worth remembering — name, preferences, ongoing
-// projects, favorite languages/tools, etc. New facts are appended, de-duplicated
-// against what's already stored, and capped so the memory store stays small
-// and cheap to inject into future system prompts.
+// ---- Memory extraction ----
 async function extractAndSaveMemories(env, username, userMessage, assistantReply) {
   const extractionPrompt = [
-    { role: "system", content: "You extract durable, long-term facts worth remembering about a user from a single chat exchange (e.g. their name, preferred language, favorite programming languages, coding preferences, personal preferences, ongoing projects, frequently used technologies). Ignore anything trivial, one-off, or purely about this single message. Respond with ONLY a JSON array of short strings, each a single standalone fact written in third person (e.g. \"Prefers TypeScript over JavaScript\"). If there is nothing worth remembering, respond with an empty array: []. Do not include any text besides the JSON array." },
-    { role: "user", content: `User message: ${userMessage.slice(0, 1000)}\n\nAssistant reply: ${assistantReply.slice(0, 1000)}` },
+    { role: 'system', content: 'You extract durable, long-term facts worth remembering about a user from a single chat exchange (e.g. their name, preferred language, favorite programming languages, coding preferences, personal preferences, ongoing projects, frequently used technologies). Ignore anything trivial, one-off, or purely about this single message. Respond with ONLY a JSON array of objects, each shaped as {"text": "<short standalone fact in third person>", "confidence": <number 0-1, how certain you are this is a durable, correctly-understood fact rather than a guess>}. Example: [{"text": "Prefers TypeScript over JavaScript", "confidence": 0.9}]. If there is nothing worth remembering, respond with an empty array: []. Do not include any text besides the JSON array.' },
+    { role: 'user', content: `User message: ${userMessage.slice(0, 1000)}\n\nAssistant reply: ${assistantReply.slice(0, 1000)}` },
   ];
 
   let extracted = [];
   try {
-    const result = await env.AI.run("@cf/meta/llama-4-scout-17b-16e-instruct", {
+    const result = await env.AI.run('@cf/meta/llama-4-scout-17b-16e-instruct', {
       messages: extractionPrompt,
       max_tokens: 300,
       temperature: 0.1,
     });
-    const raw = (result && result.response) || "[]";
+    // Support both flat and OpenAI-style response shapes
+    let raw = '';
+    if (result && typeof result.response === 'string') {
+      raw = result.response;
+    } else if (result && result.choices && result.choices[0]) {
+      raw = result.choices[0].message?.content || result.choices[0].text || '';
+    }
     const jsonMatch = raw.match(/\[[\s\S]*\]/);
     extracted = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
     if (!Array.isArray(extracted)) extracted = [];
   } catch (err) {
-    console.error("Memory extraction model call failed:", err);
+    console.error('Memory extraction model call failed:', err);
     return;
   }
-  extracted = extracted.filter(f => typeof f === "string" && f.trim().length > 0 && f.trim().length < 200).slice(0, 5);
+
+  extracted = extracted
+    .map(f => {
+      if (typeof f === 'string') return { text: f.trim(), confidence: 0.6 };
+      if (f && typeof f.text === 'string') {
+        const conf = typeof f.confidence === 'number' && f.confidence >= 0 && f.confidence <= 1 ? f.confidence : 0.6;
+        return { text: f.text.trim(), confidence: conf };
+      }
+      return null;
+    })
+    .filter(f => f && f.text.length > 0 && f.text.length < 200)
+    .slice(0, 5);
   if (extracted.length === 0) return;
 
-  const memories = (await env.KV.get(`user:${username}:memories`, "json")) || [];
-  const existingLower = new Set(memories.map(m => m.text.toLowerCase().trim()));
+  const MIN_CONFIDENCE_TO_STORE = 0.35;
+  extracted = extracted.filter(f => f.confidence >= MIN_CONFIDENCE_TO_STORE);
+  if (extracted.length === 0) return;
+
+  const memories = (await env.KV.get(`user:${username}:memories`, 'json')) || [];
   let changed = false;
+  const now = Date.now();
   for (const fact of extracted) {
-    const clean = fact.trim();
-    if (!clean || existingLower.has(clean.toLowerCase())) continue;
-    memories.push({ id: crypto.randomUUID(), text: clean, createdAt: Date.now(), auto: true });
-    existingLower.add(clean.toLowerCase());
+    const dup = findDuplicateMemory(memories, fact.text);
+    if (dup) {
+      dup.confidence = Math.min(1, Math.max(dup.confidence ?? 0.6, fact.confidence));
+      dup.updatedAt = now;
+      dup.status = 'active';
+      changed = true;
+      continue;
+    }
+    memories.push({
+      id: crypto.randomUUID(),
+      text: fact.text,
+      source: 'auto',
+      auto: true,
+      confidence: fact.confidence,
+      status: 'active',
+      createdAt: now,
+      updatedAt: now,
+      lastUsedAt: null,
+      useCount: 0,
+    });
     changed = true;
   }
   if (!changed) return;
 
-  // Cap total stored memories so the injected system prompt stays small.
   const MAX_MEMORIES = 60;
-  const trimmed = memories.length > MAX_MEMORIES ? memories.slice(memories.length - MAX_MEMORIES) : memories;
-  await env.KV.put(`user:${username}:memories`, JSON.stringify(trimmed));
+  let final = memories;
+  if (final.length > MAX_MEMORIES) {
+    final = [...final]
+      .sort((a, b) => memoryValueScore(b, now) - memoryValueScore(a, now))
+      .slice(0, MAX_MEMORIES);
+  }
+  await env.KV.put(`user:${username}:memories`, JSON.stringify(final));
 }
 
-// ---- Explicit memory command detection ----
-const EXPLICIT_MEMORY_PATTERNS = [
-  /^(remember|save|store|keep|memorize|don'?t forget|never forget)\s+(that\s+)?/i,
-  /^please\s+(remember|save|store|keep|memorize|don'?t forget|never forget)\s+(that\s+)?/i,
-  /^(can you|could you|pls|plz)\s+(remember|save|store|keep|memorize|don'?t forget|never forget)\s+(that\s+)?/i,
-  /^hey\s+(remember|save|store|keep|memorize|don'?t forget|never forget)\s+(that\s+)?/i,
-];
+// ---- Fuzzy memory dedup ----
+function normalizeMemoryText(text) {
+  return text.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+function tokenSet(text) {
+  return new Set(normalizeMemoryText(text).split(' ').filter(w => w.length > 2));
+}
+function jaccardSimilarity(setA, setB) {
+  if (setA.size === 0 || setB.size === 0) return 0;
+  let intersection = 0;
+  for (const t of setA) if (setB.has(t)) intersection++;
+  const union = setA.size + setB.size - intersection;
+  return union === 0 ? 0 : intersection / union;
+}
+const MEMORY_DUPLICATE_THRESHOLD = 0.6;
+function findDuplicateMemory(memories, candidateText) {
+  const normCandidate = normalizeMemoryText(candidateText);
+  const candidateTokens = tokenSet(candidateText);
+  for (const m of memories) {
+    if (m.status === 'deleted') continue;
+    if (normalizeMemoryText(m.text) === normCandidate) return m;
+    if (jaccardSimilarity(candidateTokens, tokenSet(m.text)) >= MEMORY_DUPLICATE_THRESHOLD) return m;
+  }
+  return null;
+}
 
+// ---- Memory lifecycle ----
+const MEMORY_STALE_AFTER_MS = 120 * 24 * 60 * 60 * 1000;
+function memoryLifecycleStatus(memory, now = Date.now()) {
+  if (memory.status === 'deleted') return 'deleted';
+  const lastTouched = memory.lastUsedAt || memory.updatedAt || memory.createdAt || 0;
+  if (now - lastTouched > MEMORY_STALE_AFTER_MS) return 'stale';
+  return memory.status === 'stale' ? 'active' : (memory.status || 'active');
+}
+function memoryValueScore(memory, now = Date.now()) {
+  const confidence = typeof memory.confidence === 'number' ? memory.confidence : (memory.auto ? 0.6 : 1.0);
+  const stale = memoryLifecycleStatus(memory, now) === 'stale';
+  const recencyBoost = memory.lastUsedAt ? 0.15 : 0;
+  const manualBoost = memory.source === 'manual' || memory.auto === false ? 0.2 : 0;
+  return confidence + recencyBoost + manualBoost - (stale ? 0.3 : 0);
+}
+
+// ---- Retrieval-based memory selection ----
+const MAX_MEMORIES_PER_PROMPT = 8;
+const MEMORY_RELEVANCE_FLOOR = 0.08;
+function selectRelevantMemories(memories, userMessage) {
+  const now = Date.now();
+  const active = memories.filter(m => m.status !== 'deleted');
+  if (active.length === 0) return [];
+  const queryTokens = tokenSet(userMessage || '');
+  const scored = active.map(m => {
+    const relevance = queryTokens.size > 0 ? jaccardSimilarity(queryTokens, tokenSet(m.text)) : 0;
+    const value = memoryValueScore(m, now);
+    return { memory: m, score: relevance * 2 + value * 0.5, relevance };
+  });
+  scored.sort((a, b) => b.score - a.score);
+  if (queryTokens.size > 0) {
+    const relevant = scored.filter(s => s.relevance >= MEMORY_RELEVANCE_FLOOR);
+    if (relevant.length > 0) return relevant.slice(0, MAX_MEMORIES_PER_PROMPT).map(s => s.memory);
+  }
+  return scored.slice(0, Math.min(4, MAX_MEMORIES_PER_PROMPT)).map(s => s.memory);
+}
+async function touchMemoryUsage(env, username, memoryIds) {
+  if (!memoryIds || memoryIds.length === 0) return;
+  const key = `user:${username}:memories`;
+  const memories = (await env.KV.get(key, 'json')) || [];
+  const idSet = new Set(memoryIds);
+  let changed = false;
+  const now = Date.now();
+  for (const m of memories) {
+    if (idSet.has(m.id)) {
+      m.lastUsedAt = now;
+      m.useCount = (m.useCount || 0) + 1;
+      if (m.status === 'stale') m.status = 'active';
+      changed = true;
+    }
+  }
+  if (changed) await env.KV.put(key, JSON.stringify(memories));
+}
+
+// ---------------------------------------------------------------------
+// Explicit-memory detection — tightened.
+// "keep"/"save"/"store" now require an explicit object ("that"/"this"/
+// "the following"/"these"). Plain "keep it short" no longer matches.
+// ---------------------------------------------------------------------
+const EXPLICIT_MEMORY_PATTERNS = [
+  /^(remember|memorize|don'?t forget|never forget)\s+(that\s+)?/i,
+  /^please\s+(remember|memorize|don'?t forget|never forget)\s+(that\s+)?/i,
+  /^(can you|could you|pls|plz)\s+(remember|memorize|don'?t forget|never forget)\s+(that\s+)?/i,
+  /^hey\s+(remember|memorize|don'?t forget|never forget)\s+(that\s+)?/i,
+  /^(save|keep|store)\s+(that|this|the following|these)\b/i,
+  /^please\s+(save|keep|store)\s+(that|this|the following|these)\b/i,
+];
 function isExplicitMemoryRequest(message) {
   if (!message || typeof message !== 'string') return false;
   const trimmed = message.trim();
   return EXPLICIT_MEMORY_PATTERNS.some(p => p.test(trimmed));
 }
-
 function extractMemoryText(message) {
   if (!message || typeof message !== 'string') return '';
   let text = message.trim();
@@ -640,32 +1159,23 @@ function extractMemoryText(message) {
   return text.trim();
 }
 
-// ---- Cloudflare AI Search Service Abstraction ----
-// Supports BOTH binding types:
-//   1. Namespace binding: env.AI_SEARCH.get(instanceName)
-//   2. Direct instance binding: env.MY_SEARCH
+// ---- Search Service ----
 class SearchService {
   constructor(env) {
     this.env = env;
     this.instance = this._resolveBinding();
     this.enabled = !!this.instance;
   }
-
   _resolveBinding() {
-    // Option 1: Namespace binding
     if (this.env.AI_SEARCH && typeof this.env.AI_SEARCH.get === 'function') {
       try { return this.env.AI_SEARCH.get('default'); } catch (e) {}
     }
-    // Option 2: Direct instance binding (env.MY_SEARCH, env.SEARCH, etc.)
     const directKeys = ['MY_SEARCH', 'SEARCH', 'AI_SEARCH_INSTANCE'];
     for (const key of directKeys) {
-      if (this.env[key] && typeof this.env[key].search === 'function') {
-        return this.env[key];
-      }
+      if (this.env[key] && typeof this.env[key].search === 'function') return this.env[key];
     }
     return null;
   }
-
   async search(query, options = {}) {
     if (!this.enabled || !this.instance) return { results: [] };
     try {
@@ -676,7 +1186,6 @@ class SearchService {
       return { results: [] };
     }
   }
-
   async chat(messages, options = {}) {
     if (!this.enabled || !this.instance) return null;
     try {
@@ -689,91 +1198,78 @@ class SearchService {
       return null;
     }
   }
-
   async index(id, data) {
     if (!this.enabled || !this.instance) return;
-    try {
-      if (typeof this.instance.put === 'function') {
-        await this.instance.put(id, data);
-      } else if (typeof this.instance.index === 'function') {
-        await this.instance.index(id, data);
+    const statusKey = `index_status:${id}`;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        if (typeof this.instance.put === 'function') await this.instance.put(id, data);
+        else if (typeof this.instance.index === 'function') await this.instance.index(id, data);
+        await this.env.KV.put(statusKey, JSON.stringify({ status: 'ok', lastIndexedAt: Date.now() }), { expirationTtl: 60 * 60 * 24 * 30 }).catch(() => {});
+        return;
+      } catch (err) {
+        console.error(`AI Search index error (attempt ${attempt}):`, err);
+        if (attempt === 2) {
+          await this.env.KV.put(statusKey, JSON.stringify({ status: 'failed', lastAttemptAt: Date.now(), error: String(err && err.message ? err.message : err) }), { expirationTtl: 60 * 60 * 24 * 30 }).catch(() => {});
+        } else {
+          await new Promise(r => setTimeout(r, 300));
+        }
       }
-    } catch (err) {
-      console.error('AI Search index error:', err);
     }
   }
-
   async deleteIndex(id) {
     if (!this.enabled || !this.instance) return;
     try {
-      if (typeof this.instance.delete === 'function') {
-        await this.instance.delete(id);
-      }
+      if (typeof this.instance.delete === 'function') await this.instance.delete(id);
     } catch (err) {
       console.error('AI Search delete index error:', err);
     }
   }
 }
 
-// ---- Search Index Helpers ----
 async function indexConversation(searchService, username, conv) {
   if (!searchService || !searchService.enabled) return;
   try {
-    const messages = (await searchService.env.KV.get(`user:${username}:conv:${conv.id}`, "json")) || [];
-    const memories = (await searchService.env.KV.get(`user:${username}:memories`, "json")) || [];
-    const memoryTexts = memories.map(m => m.text).join('\n');
+    const messages = await loadConversationMessages(searchService.env, username, conv.id);
     const userMsgs = messages.filter(m => m.role === 'user').map(m => m.content).join('\n');
     const assistantMsgs = messages.filter(m => m.role === 'assistant').map(m => m.content).join('\n');
-    const searchData = {
+    await searchService.index(`conv:${username}:${conv.id}`, {
       conversationId: conv.id,
       username,
       title: conv.title || 'Session',
       userMessages: userMsgs.slice(0, 5000),
       assistantMessages: assistantMsgs.slice(0, 5000),
-      memories: memoryTexts.slice(0, 2000),
       updatedAt: conv.updated_at || Date.now(),
-    };
-    await searchService.index(`conv:${username}:${conv.id}`, searchData);
+    });
   } catch (err) {
     console.error('Index conversation error:', err);
   }
 }
-
 async function indexMemory(searchService, username, memories) {
   if (!searchService || !searchService.enabled) return;
   try {
-    const conversations = (await searchService.env.KV.get(`user:${username}:convs`, "json")) || [];
-    const memoryTexts = memories.map(m => m.text).join('\n');
-    for (const conv of conversations) {
-      const msgs = (await searchService.env.KV.get(`user:${username}:conv:${conv.id}`, "json")) || [];
-      const userMsgs = msgs.filter(m => m.role === 'user').map(m => m.content).join('\n');
-      const assistantMsgs = msgs.filter(m => m.role === 'assistant').map(m => m.content).join('\n');
-      await searchService.index(`conv:${username}:${conv.id}`, {
-        conversationId: conv.id,
-        username,
-        title: conv.title || 'Session',
-        userMessages: userMsgs.slice(0, 5000),
-        assistantMessages: assistantMsgs.slice(0, 5000),
-        memories: memoryTexts.slice(0, 2000),
-        updatedAt: conv.updated_at || Date.now(),
-      });
-    }
+    const memoryTexts = memories.filter(m => m.status !== 'deleted').map(m => m.text).join('\n');
+    await searchService.index(`mem:${username}`, {
+      username,
+      type: 'memory',
+      memories: memoryTexts.slice(0, 4000),
+      updatedAt: Date.now(),
+    });
   } catch (err) {
     console.error('Index memory error:', err);
   }
 }
 
-// ---- Export chat helpers ----
+// ---- Export helpers ----
 function formatTimestamp(ts) {
   try { return new Date(ts || Date.now()).toISOString(); } catch { return new Date().toISOString(); }
 }
-
 function buildExportMarkdown(conv, messages) {
-  let out = `# ${conv.title || "Conversation"}\n\n`;
+  let out = `# ${conv.title || 'Conversation'}\n\n`;
   out += `_Exported ${formatTimestamp(Date.now())}_\n\n---\n\n`;
   for (const m of messages) {
-    const speaker = m.role === "user" ? "**You**" : "**Assistant**";
-    out += `${speaker} _(${formatTimestamp(m.created_at)})_\n\n${m.content || ""}\n\n`;
+    const speaker = m.role === 'user' ? '**You**' : '**Assistant**';
+    out += `${speaker} _(${formatTimestamp(m.created_at)})_\n\n${m.content || ''}\n\n`;
     if (m.images && m.images.length) {
       m.images.forEach((img, i) => { out += `![attached image ${i + 1}](${img})\n\n`; });
     }
@@ -781,52 +1277,46 @@ function buildExportMarkdown(conv, messages) {
   }
   return out;
 }
-
 function buildExportTxt(conv, messages) {
-  let out = `${conv.title || "Conversation"}\n`;
+  let out = `${conv.title || 'Conversation'}\n`;
   out += `Exported ${formatTimestamp(Date.now())}\n`;
-  out += `${"=".repeat(40)}\n\n`;
+  out += `${'='.repeat(40)}\n\n`;
   for (const m of messages) {
-    const speaker = m.role === "user" ? "You" : "Assistant";
-    out += `[${formatTimestamp(m.created_at)}] ${speaker}:\n${(m.content || "").replace(/[#*`_>]/g, "")}\n\n`;
-    if (m.images && m.images.length) out += `(${m.images.length} image attachment${m.images.length > 1 ? "s" : ""})\n\n`;
+    const speaker = m.role === 'user' ? 'You' : 'Assistant';
+    out += `[${formatTimestamp(m.created_at)}] ${speaker}:\n${(m.content || '').replace(/[#*`_>]/g, '')}\n\n`;
+    if (m.images && m.images.length) out += `(${m.images.length} image attachment${m.images.length > 1 ? 's' : ''})\n\n`;
   }
   return out;
 }
-
 function escapeHtmlServer(str) {
-  return (str || "").toString()
-    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  return (str || '').toString()
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
-
-// Very small, dependency-free Markdown -> HTML converter used only for the
-// exported HTML file (the live app uses marked.js in the browser instead).
 function simpleMarkdownToHtml(md) {
   let html = escapeHtmlServer(md);
   html = html.replace(/```([\s\S]*?)```/g, (_, code) => `<pre><code>${code}</code></pre>`);
-  html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
-  html = html.replace(/^### (.*)$/gm, "<h3>$1</h3>");
-  html = html.replace(/^## (.*)$/gm, "<h2>$1</h2>");
-  html = html.replace(/^# (.*)$/gm, "<h1>$1</h1>");
-  html = html.replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>");
-  html = html.replace(/\n{2,}/g, "</p><p>");
-  html = html.replace(/\n/g, "<br>");
+  html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+  html = html.replace(/^### (.*)$/gm, '<h3>$1</h3>');
+  html = html.replace(/^## (.*)$/gm, '<h2>$1</h2>');
+  html = html.replace(/^# (.*)$/gm, '<h1>$1</h1>');
+  html = html.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+  html = html.replace(/\n{2,}/g, '</p><p>');
+  html = html.replace(/\n/g, '<br>');
   return `<p>${html}</p>`;
 }
-
 function buildExportHtml(conv, messages) {
-  const title = escapeHtmlServer(conv.title || "Conversation");
+  const title = escapeHtmlServer(conv.title || 'Conversation');
   const rows = messages.map(m => {
-    const speaker = m.role === "user" ? "You" : "Assistant";
-    const imgs = (m.images || []).map(src => `<img src="${src}" style="max-width:240px;border-radius:6px;margin:6px 6px 0 0;">`).join("");
+    const speaker = m.role === 'user' ? 'You' : 'Assistant';
+    const imgs = (m.images || []).map(src => `<img src="${src}" style="max-width:240px;border-radius:6px;margin:6px 6px 0 0;">`).join('');
     return `
-      <div class="msg ${m.role === "user" ? "user" : "assistant"}">
+      <div class="msg ${m.role === 'user' ? 'user' : 'assistant'}">
         <div class="meta">${speaker} · ${escapeHtmlServer(formatTimestamp(m.created_at))}</div>
-        <div class="content">${simpleMarkdownToHtml(m.content || "")}</div>
-        ${imgs ? `<div class="imgs">${imgs}</div>` : ""}
+        <div class="content">${simpleMarkdownToHtml(m.content || '')}</div>
+        ${imgs ? `<div class="imgs">${imgs}</div>` : ''}
       </div>`;
-  }).join("\n");
+  }).join('\n');
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -850,7 +1340,6 @@ ${rows}
 </body>
 </html>`;
 }
-
 function buildExportJson(conv, messages) {
   return JSON.stringify({
     conversationId: conv.id,
@@ -859,54 +1348,45 @@ function buildExportJson(conv, messages) {
     updatedAt: conv.updated_at ? formatTimestamp(conv.updated_at) : null,
     messages: messages.map(m => ({
       role: m.role,
-      content: m.content || "",
+      content: m.content || '',
       images: m.images || [],
       timestamp: formatTimestamp(m.created_at),
     })),
   }, null, 2);
 }
-
 function buildExportResponse(conv, messages, format) {
-  const safeTitle = (conv.title || "chat").replace(/[^a-z0-9\-_]+/gi, "_").slice(0, 60) || "chat";
+  const safeTitle = (conv.title || 'chat').replace(/[^a-z0-9\-_]+/gi, '_').slice(0, 60) || 'chat';
   let body, contentType, ext;
   switch (format) {
-    case "txt":
-      body = buildExportTxt(conv, messages); contentType = "text/plain; charset=utf-8"; ext = "txt"; break;
-    case "html":
-      body = buildExportHtml(conv, messages); contentType = "text/html; charset=utf-8"; ext = "html"; break;
-    case "json":
-      body = buildExportJson(conv, messages); contentType = "application/json; charset=utf-8"; ext = "json"; break;
-    case "markdown":
-    default:
-      body = buildExportMarkdown(conv, messages); contentType = "text/markdown; charset=utf-8"; ext = "md"; break;
+    case 'txt': body = buildExportTxt(conv, messages); contentType = 'text/plain; charset=utf-8'; ext = 'txt'; break;
+    case 'html': body = buildExportHtml(conv, messages); contentType = 'text/html; charset=utf-8'; ext = 'html'; break;
+    case 'json': body = buildExportJson(conv, messages); contentType = 'application/json; charset=utf-8'; ext = 'json'; break;
+    case 'markdown':
+    default: body = buildExportMarkdown(conv, messages); contentType = 'text/markdown; charset=utf-8'; ext = 'md'; break;
   }
   return new Response(body, {
     headers: {
-      "Content-Type": contentType,
-      "Content-Disposition": `attachment; filename="${safeTitle}.${ext}"`,
-      "Access-Control-Allow-Origin": "*",
+      'Content-Type': contentType,
+      'Content-Disposition': `attachment; filename="${safeTitle}.${ext}"`,
     },
   });
 }
 
-// ---- Web Search (Tavily) ----
-// Calls the Tavily Search API and returns a small, trimmed set of results.
-// Never throws: on any failure (missing key, network error, timeout, rate
-// limit, bad response) it returns { ok: false, results: [], error }.
+// ---- Web search ----
 async function performWebSearch(env, query) {
   if (!env.TAVILY_API_KEY) {
-    return { ok: false, results: [], error: "Web search is not configured." };
+    return { ok: false, results: [], error: 'Web search is not configured.' };
   }
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 8000);
   try {
-    const res = await fetch("https://api.tavily.com/search", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
+    const res = await fetch('https://api.tavily.com/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         api_key: env.TAVILY_API_KEY,
         query,
-        search_depth: "basic",
+        search_depth: 'basic',
         max_results: 5,
         include_answer: false,
         include_images: false,
@@ -914,183 +1394,432 @@ async function performWebSearch(env, query) {
       signal: controller.signal,
     });
     clearTimeout(timeoutId);
-
-    if (res.status === 429) {
-      return { ok: false, results: [], error: "Web search rate limit reached." };
-    }
-    if (!res.ok) {
-      return { ok: false, results: [], error: `Web search failed (status ${res.status}).` };
-    }
-
+    if (res.status === 429) return { ok: false, results: [], error: 'Web search rate limit reached.' };
+    if (!res.ok) return { ok: false, results: [], error: `Web search failed (status ${res.status}).` };
     const data = await res.json();
     const rawResults = Array.isArray(data.results) ? data.results : [];
-    // Trim to the most relevant few results and cap snippet length to keep
-    // token usage down.
     const results = rawResults.slice(0, 5).map(r => ({
-      title: (r.title || "Untitled").toString().slice(0, 200),
-      content: (r.content || "").toString().slice(0, 600),
-      url: (r.url || "").toString(),
+      title: (r.title || 'Untitled').toString().slice(0, 200),
+      content: (r.content || '').toString().slice(0, 600),
+      url: (r.url || '').toString(),
     }));
     return { ok: true, results, error: null };
   } catch (err) {
     clearTimeout(timeoutId);
-    const message = err.name === "AbortError" ? "Web search timed out." : "Web search unavailable.";
+    const message = err.name === 'AbortError' ? 'Web search timed out.' : 'Web search unavailable.';
     return { ok: false, results: [], error: message };
   }
 }
-
-// Builds a system message that injects search results into the prompt without
-// ever showing the raw JSON to the model verbatim as "truth" — it's framed
-// explicitly as retrieved information the model should ground its answer in.
 function buildWebSearchSystemMessage(results) {
   if (!results || results.length === 0) return null;
   const formatted = results
     .map((r, i) => `[${i + 1}] ${r.title}\n${r.content}\nSource: ${r.url}`)
-    .join("\n\n");
+    .join('\n\n');
   return (
-    "The following information was retrieved from a web search. Use it to answer accurately. " +
-    "If the search results are insufficient, say so instead of making up information. " +
-    "Where helpful, reference sources inline using their bracketed number (e.g. [1]).\n\n" +
+    'The following information was retrieved from a web search. Use it to answer accurately. ' +
+    'If the search results are insufficient, say so instead of making up information. ' +
+    'Where helpful, reference sources inline using their bracketed number (e.g. [1]).\n\n' +
     formatted
   );
 }
 
+// ---- Generation / job system ----
+const GENERATION_STALE_MS = 120000; // 2 minutes
+function generationKey(username, conversationId) {
+  return `user:${username}:conv:${conversationId}:generation`;
+}
+async function getActiveGeneration(env, username, conversationId) {
+  const job = await env.KV.get(generationKey(username, conversationId), 'json');
+  if (job && (job.status === 'queued' || job.status === 'running')) {
+    const age = Date.now() - (job.startedAt || 0);
+    if (age > GENERATION_STALE_MS) {
+      // Treat as stale, mark failed, and let the new request proceed.
+      job.status = 'failed';
+      job.error = 'Generation timed out (stale).';
+      job.completedAt = Date.now();
+      await putGeneration(env, username, conversationId, job, 120).catch(() => {});
+      return null;
+    }
+    return job;
+  }
+  return null;
+}
+async function putGeneration(env, username, conversationId, job, ttlSeconds = 600) {
+  await env.KV.put(generationKey(username, conversationId), JSON.stringify(job), { expirationTtl: ttlSeconds });
+}
+
+// ---- Image validation ----
+const MAX_IMAGES_PER_MESSAGE = 6;
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+const ALLOWED_IMAGE_MIME_TYPES = ['image/png', 'image/jpeg', 'image/jpg', 'image/gif', 'image/webp'];
+const DATA_URL_RE = /^data:(image\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=]+)$/;
+function validateImages(images) {
+  if (!Array.isArray(images)) return { ok: false, error: 'Invalid image payload.' };
+  if (images.length > MAX_IMAGES_PER_MESSAGE) {
+    return { ok: false, error: `Too many images attached (max ${MAX_IMAGES_PER_MESSAGE} per message).` };
+  }
+  for (const img of images) {
+    if (typeof img !== 'string') return { ok: false, error: 'Malformed image attachment.' };
+    if (isAttachmentRef(img)) continue;
+    const match = img.match(DATA_URL_RE);
+    if (!match) return { ok: false, error: 'Only base64 image data URLs are accepted.' };
+    const [, mime, b64] = match;
+    if (!ALLOWED_IMAGE_MIME_TYPES.includes(mime.toLowerCase())) {
+      return { ok: false, error: `Unsupported image type: ${mime}.` };
+    }
+    const padding = (b64.endsWith('==') ? 2 : b64.endsWith('=') ? 1 : 0);
+    const approxBytes = (b64.length * 3) / 4 - padding;
+    if (approxBytes > MAX_IMAGE_BYTES) {
+      return { ok: false, error: `Image too large (max ${(MAX_IMAGE_BYTES / (1024 * 1024)).toFixed(0)}MB per image).` };
+    }
+    if (approxBytes <= 0) return { ok: false, error: 'Empty or malformed image attachment.' };
+  }
+  return { ok: true };
+}
+
+// ---- Conversation/message data architecture ----
+const CONV_PAGE_SIZE = 40;
+function convMetaKey(username, conversationId) { return `user:${username}:conv:${conversationId}:meta`; }
+function convPageKey(username, conversationId, pageIndex) { return `user:${username}:conv:${conversationId}:page:${pageIndex}`; }
+function convLegacyKey(username, conversationId) { return `user:${username}:conv:${conversationId}`; }
+
+async function loadConversationMeta(env, username, conversationId) {
+  return await env.KV.get(convMetaKey(username, conversationId), 'json');
+}
+
+async function loadConversationMessages(env, username, conversationId) {
+  const meta = await loadConversationMeta(env, username, conversationId);
+  if (meta) {
+    const pageCount = meta.pageCount || 0;
+    if (pageCount === 0) return [];
+    const pages = await Promise.all(
+      Array.from({ length: pageCount }, (_, i) => env.KV.get(convPageKey(username, conversationId, i), 'json'))
+    );
+    return pages.flatMap(p => p || []);
+  }
+  const legacy = await env.KV.get(convLegacyKey(username, conversationId), 'json');
+  return legacy || [];
+}
+
+async function saveConversationMessages(env, username, conversationId, messages, extraMeta = {}) {
+  const wasLegacy = !(await loadConversationMeta(env, username, conversationId));
+  const stamped = messages.map((m, i) => {
+    if (!m.messageId) m.messageId = `${conversationId}:${i}:${m.created_at || m.createdAt || Date.now()}`;
+    if (!m.conversationId) m.conversationId = conversationId;
+    return m;
+  });
+  const priorMeta = await loadConversationMeta(env, username, conversationId);
+  const priorPageCount = priorMeta ? (priorMeta.pageCount || 0) : 0;
+  const pages = [];
+  for (let i = 0; i < stamped.length; i += CONV_PAGE_SIZE) pages.push(stamped.slice(i, i + CONV_PAGE_SIZE));
+  const writes = pages.map((page, i) => env.KV.put(convPageKey(username, conversationId, i), JSON.stringify(page)));
+  if (priorPageCount > pages.length) {
+    for (let k = pages.length; k < priorPageCount; k++) {
+      writes.push(env.KV.delete(convPageKey(username, conversationId, k)).catch(() => {}));
+    }
+  }
+  await Promise.all(writes);
+  const now = Date.now();
+  const lastMsg = stamped[stamped.length - 1];
+  const meta = {
+    id: conversationId,
+    title: extraMeta.title || (priorMeta && priorMeta.title) || 'New Chat',
+    createdAt: (priorMeta && priorMeta.createdAt) || now,
+    updatedAt: now,
+    messageCount: stamped.length,
+    lastMessageAt: lastMsg ? (lastMsg.createdAt || lastMsg.created_at || now) : ((priorMeta && priorMeta.lastMessageAt) || null),
+    lastGenerationId: extraMeta.lastGenerationId || (priorMeta && priorMeta.lastGenerationId) || null,
+    pageCount: pages.length,
+  };
+  await env.KV.put(convMetaKey(username, conversationId), JSON.stringify(meta));
+  if (wasLegacy) env.KV.delete(convLegacyKey(username, conversationId)).catch(() => {});
+  return stamped;
+}
+
+async function appendConversationMessage(env, username, conversationId, message, extraMeta = {}) {
+  const meta = await loadConversationMeta(env, username, conversationId);
+  if (!meta) {
+    const legacy = (await env.KV.get(convLegacyKey(username, conversationId), 'json')) || [];
+    legacy.push(message);
+    await saveConversationMessages(env, username, conversationId, legacy, extraMeta);
+    return;
+  }
+  const pageCount = meta.pageCount || 0;
+  let targetPageIndex = Math.max(0, pageCount - 1);
+  let page = pageCount > 0 ? ((await env.KV.get(convPageKey(username, conversationId, targetPageIndex), 'json')) || []) : [];
+  if (page.length >= CONV_PAGE_SIZE) {
+    targetPageIndex = pageCount;
+    page = [];
+  }
+  const index = meta.messageCount || 0;
+  if (!message.messageId) message.messageId = `${conversationId}:${index}:${message.created_at || message.createdAt || Date.now()}`;
+  if (!message.conversationId) message.conversationId = conversationId;
+  page.push(message);
+  await env.KV.put(convPageKey(username, conversationId, targetPageIndex), JSON.stringify(page));
+  const now = Date.now();
+  meta.updatedAt = now;
+  meta.messageCount = index + 1;
+  meta.lastMessageAt = message.createdAt || message.created_at || now;
+  meta.pageCount = targetPageIndex + 1;
+  if (extraMeta.lastGenerationId) meta.lastGenerationId = extraMeta.lastGenerationId;
+  if (extraMeta.title) meta.title = extraMeta.title;
+  await env.KV.put(convMetaKey(username, conversationId), JSON.stringify(meta));
+}
+
+async function deleteConversationMessages(env, username, conversationId) {
+  const meta = await loadConversationMeta(env, username, conversationId);
+  const tasks = [
+    env.KV.delete(convLegacyKey(username, conversationId)).catch(() => {}),
+    env.KV.delete(convMetaKey(username, conversationId)).catch(() => {}),
+  ];
+  const pageCount = meta ? (meta.pageCount || 0) : 0;
+  for (let i = 0; i < pageCount; i++) tasks.push(env.KV.delete(convPageKey(username, conversationId, i)).catch(() => {}));
+  await Promise.all(tasks);
+  if (env.ATTACHMENTS) {
+    try {
+      const listed = await env.ATTACHMENTS.list({ prefix: `${username}/${conversationId}/` });
+      if (listed && listed.objects && listed.objects.length) {
+        await Promise.all(listed.objects.map(o => env.ATTACHMENTS.delete(o.key).catch(() => {})));
+      }
+    } catch (err) {
+      console.error('Attachment cleanup error:', err);
+    }
+  }
+}
+
+// ---- Image attachments ----
+const ATTACHMENT_URL_PREFIX = '/api/attachments/';
+function isAttachmentRef(src) {
+  return typeof src === 'string' && src.startsWith(ATTACHMENT_URL_PREFIX);
+}
+function attachmentR2Key(username, conversationId, attachmentId) {
+  return `${username}/${conversationId}/${attachmentId}`;
+}
+function base64ToBytes(b64) {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+function bytesToBase64(bytes) {
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+async function storeImageAttachment(env, username, conversationId, dataUrl) {
+  if (!env.ATTACHMENTS) return null;
+  const match = typeof dataUrl === 'string' && dataUrl.match(DATA_URL_RE);
+  if (!match) return null;
+  const [, mime, b64] = match;
+  try {
+    const bytes = base64ToBytes(b64);
+    const attachmentId = crypto.randomUUID();
+    await env.ATTACHMENTS.put(attachmentR2Key(username, conversationId, attachmentId), bytes, {
+      httpMetadata: { contentType: mime },
+    });
+    return `${ATTACHMENT_URL_PREFIX}${attachmentId}?conversationId=${encodeURIComponent(conversationId)}`;
+  } catch (err) {
+    console.error('Attachment store error:', err);
+    return null;
+  }
+}
+async function resolveImageForModel(env, username, imgSrc) {
+  if (!isAttachmentRef(imgSrc)) return imgSrc;
+  if (!env.ATTACHMENTS) return null;
+  try {
+    const parsed = new URL(imgSrc, 'https://internal.local');
+    const attachmentId = parsed.pathname.slice(ATTACHMENT_URL_PREFIX.length);
+    const conversationId = parsed.searchParams.get('conversationId');
+    if (!attachmentId || !conversationId) return null;
+    const obj = await env.ATTACHMENTS.get(attachmentR2Key(username, conversationId, attachmentId));
+    if (!obj) return null;
+    const bytes = new Uint8Array(await obj.arrayBuffer());
+    const mime = (obj.httpMetadata && obj.httpMetadata.contentType) || 'image/png';
+    return `data:${mime};base64,${bytesToBase64(bytes)}`;
+  } catch (err) {
+    console.error('Attachment resolve error:', err);
+    return null;
+  }
+}
+
 function jsonResponse(data, status = 200) {
-return new Response(JSON.stringify(data), {
-status,
-headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
-});
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { 'Content-Type': 'application/json' },
+  });
 }
 
-// Convert ArrayBuffer to hex
 function bufferToHex(buffer) {
-return Array.from(new Uint8Array(buffer))
-.map(b => b.toString(16).padStart(2, '0'))
-.join('');
+  return Array.from(new Uint8Array(buffer))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
 }
-
-// Hash password with PBKDF2
+function generateSalt() {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return bufferToHex(bytes.buffer);
+}
 async function hashPassword(password, salt, env) {
-const encoder = new TextEncoder();
-const key = await crypto.subtle.importKey(
-'raw',
-encoder.encode(password),
-{ name: 'PBKDF2' },
-false,
-['deriveBits']
-);
-const bits = await crypto.subtle.deriveBits(
-{
-name: 'PBKDF2',
-salt: encoder.encode(salt + (env.SALT_PREFIX || 'default_salt')),
-iterations: 100000,
-hash: 'SHA-256',
-},
-key,
-256
-);
-return bufferToHex(bits);
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey('raw', encoder.encode(password), { name: 'PBKDF2' }, false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt: encoder.encode(salt + (env.SALT_PREFIX || 'default_salt')), iterations: 100000, hash: 'SHA-256' },
+    key, 256
+  );
+  return bufferToHex(bits);
 }
-
-// Create JWT token
 async function createToken(username, env) {
-const header = { alg: 'HS256', typ: 'JWT' };
-const payload = {
-sub: username,
-iat: Math.floor(Date.now() / 1000),
-exp: Math.floor(Date.now() / 1000) + 7 * 24 * 60 * 60, // 7 days
-};
-const encoder = new TextEncoder();
-const headerB64 = btoa(JSON.stringify(header)).replace(/=/g, '');
-const payloadB64 = btoa(JSON.stringify(payload)).replace(/=/g, '');
-const data = `${headerB64}.${payloadB64}`;
-
-const key = await crypto.subtle.importKey(
-'raw',
-encoder.encode(env.JWT_SECRET),
-{ name: 'HMAC', hash: 'SHA-256' },
-false,
-['sign']
-);
-const sig = await crypto.subtle.sign('HMAC', key, encoder.encode(data));
-const sigB64 = btoa(String.fromCharCode(...new Uint8Array(sig)))
-.replace(/=/g, '')
-.replace(/\+/g, '-')
-.replace(/\//g, '_');
-return `${data}.${sigB64}`;
+  const header = { alg: 'HS256', typ: 'JWT' };
+  const payload = { sub: username, iat: Math.floor(Date.now() / 1000), exp: Math.floor(Date.now() / 1000) + 7 * 24 * 60 * 60 };
+  const encoder = new TextEncoder();
+  const headerB64 = btoa(JSON.stringify(header)).replace(/=/g, '');
+  const payloadB64 = btoa(JSON.stringify(payload)).replace(/=/g, '');
+  const data = `${headerB64}.${payloadB64}`;
+  const key = await crypto.subtle.importKey('raw', encoder.encode(env.JWT_SECRET), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', key, encoder.encode(data));
+  const sigB64 = btoa(String.fromCharCode(...new Uint8Array(sig)))
+    .replace(/=/g, '')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_');
+  return `${data}.${sigB64}`;
 }
-
-// Verify JWT and return username or null
 async function verifyToken(token, env) {
-try {
-const parts = token.split('.');
-if (parts.length !== 3) return null;
-const [headerB64, payloadB64, sigB64] = parts;
-const data = `${headerB64}.${payloadB64}`;
-
-const encoder = new TextEncoder();
-const key = await crypto.subtle.importKey(
-  'raw',
-  encoder.encode(env.JWT_SECRET),
-  { name: 'HMAC', hash: 'SHA-256' },
-  false,
-  ['verify']
-);
-const sig = new Uint8Array(
-  atob(sigB64.replace(/-/g, '+').replace(/_/g, '/'))
-    .split('')
-    .map(c => c.charCodeAt(0))
-);
-const valid = await crypto.subtle.verify('HMAC', key, sig, encoder.encode(data));
-if (!valid) return null;
-
-const payload = JSON.parse(atob(payloadB64));
-if (payload.exp * 1000 < Date.now()) return null;
-return payload.sub;
-} catch {
-return null;
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+    const [headerB64, payloadB64, sigB64] = parts;
+    const data = `${headerB64}.${payloadB64}`;
+    const encoder = new TextEncoder();
+    const key = await crypto.subtle.importKey('raw', encoder.encode(env.JWT_SECRET), { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']);
+    const sig = new Uint8Array(
+      atob(sigB64.replace(/-/g, '+').replace(/_/g, '/'))
+        .split('')
+        .map(c => c.charCodeAt(0))
+    );
+    const valid = await crypto.subtle.verify('HMAC', key, sig, encoder.encode(data));
+    if (!valid) return null;
+    const payload = JSON.parse(atob(payloadB64));
+    if (payload.exp * 1000 < Date.now()) return null;
+    return payload.sub;
+  } catch {
+    return null;
+  }
 }
-}
-
-// Extract and verify user from Authorization header
 async function authenticate(request, env) {
-const authHeader = request.headers.get('Authorization');
-if (!authHeader || !authHeader.startsWith('Bearer ')) return null;
-const token = authHeader.slice(7);
-return await verifyToken(token, env);
+  const authHeader = request.headers.get('Authorization');
+  if (!authHeader || !authHeader.startsWith('Bearer ')) return null;
+  const token = authHeader.slice(7);
+  return await verifyToken(token, env);
 }
 
-// Signup handler
+// ---- Auth rate limiting ----
+const AUTH_RL_WINDOW_MS = 10 * 60 * 1000;
+const AUTH_RL_MAX_ATTEMPTS = 10;
+const AUTH_RL_BACKOFF_AFTER = 5;
+const AUTH_RL_BACKOFF_STEP_MS = 5000;
+
+function getClientIp(request) {
+  return request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For') || 'unknown';
+}
+async function checkAuthRateLimit(env, key) {
+  const rlKey = `rl:auth:${key}`;
+  const now = Date.now();
+  let data = await env.KV.get(rlKey, 'json');
+  if (!data || now > data.resetTime) {
+    data = { count: 0, resetTime: now + AUTH_RL_WINDOW_MS, failures: 0, blockedUntil: 0 };
+  }
+  if (data.blockedUntil && now < data.blockedUntil) {
+    return { allowed: false, retryAfterMs: data.blockedUntil - now, data, rlKey };
+  }
+  if (data.count >= AUTH_RL_MAX_ATTEMPTS) {
+    return { allowed: false, retryAfterMs: data.resetTime - now, data, rlKey };
+  }
+  data.count++;
+  await env.KV.put(rlKey, JSON.stringify(data), { expirationTtl: Math.ceil(AUTH_RL_WINDOW_MS / 1000) + 60 });
+  return { allowed: true, retryAfterMs: 0, data, rlKey };
+}
+async function recordAuthFailure(env, rlKey, data) {
+  data.failures = (data.failures || 0) + 1;
+  if (data.failures >= AUTH_RL_BACKOFF_AFTER) {
+    const extra = data.failures - AUTH_RL_BACKOFF_AFTER + 1;
+    data.blockedUntil = Date.now() + extra * AUTH_RL_BACKOFF_STEP_MS;
+  }
+  await env.KV.put(rlKey, JSON.stringify(data), { expirationTtl: Math.ceil(AUTH_RL_WINDOW_MS / 1000) + 60 });
+}
+async function recordAuthSuccess(env, rlKey) {
+  await env.KV.delete(rlKey).catch(() => {});
+}
+
 async function handleSignup(request, env) {
-const { username, password } = await request.json();
-if (!username || !password || username.length < 3 || password.length < 6) {
-return jsonResponse({ error: 'Invalid username or password (min 3 / 6 chars)' }, 400);
+  const ip = getClientIp(request);
+  const ipLimit = await checkAuthRateLimit(env, `signup:ip:${ip}`);
+  if (!ipLimit.allowed) return jsonResponse({ error: 'Too many signup attempts. Please try again later.' }, 429);
+
+  let body;
+  try { body = await request.json(); } catch { return jsonResponse({ error: 'Invalid request body' }, 400); }
+  const { username, password } = body || {};
+  if (!username || !password || typeof username !== 'string' || typeof password !== 'string' ||
+      username.length < 3 || username.length > 32 || password.length < 6 || password.length > 256 ||
+      !/^[a-zA-Z0-9_.-]+$/.test(username)) {
+    return jsonResponse({ error: 'Invalid username or password (username: 3-32 alphanumeric chars, password: min 6 chars)' }, 400);
+  }
+ const userKey = `user:${username}`;
+  const existing = await env.KV.get(userKey);
+  if (existing) return jsonResponse({ error: 'Username already exists' }, 409);
+  const salt = generateSalt();
+  const hash = await hashPassword(password, salt, env);
+  const record = { passwordHash: hash, salt, createdAt: Date.now() };
+  await env.KV.put(userKey, JSON.stringify(record));
+  // Best-effort race check: KV has no atomic compare-and-swap on the free
+  // plan, so this can't be made fully safe without a Durable Object. This
+  // re-read at least catches same-isolate races and logs a warning.
+  const verify = await env.KV.get(userKey, 'json');
+  if (verify && verify.createdAt !== record.createdAt) {
+    console.error(JSON.stringify({ event: 'signup_race_detected', username }));
+  }
+  await recordAuthSuccess(env, ipLimit.rlKey);
+  const token = await createToken(username, env);
+  return jsonResponse({ token });
 }
 
-const userKey = `user:${username}`;
-const existing = await env.KV.get(userKey);
-if (existing) return jsonResponse({ error: 'Username already exists' }, 409);
-
-const hash = await hashPassword(password, username, env);
-await env.KV.put(userKey, JSON.stringify({ passwordHash: hash, createdAt: Date.now() }));
-const token = await createToken(username, env);
-return jsonResponse({ token });
-}
-
-// Login handler
 async function handleLogin(request, env) {
-const { username, password } = await request.json();
-if (!username || !password) return jsonResponse({ error: 'Missing credentials' }, 400);
+  const ip = getClientIp(request);
+  const ipLimit = await checkAuthRateLimit(env, `login:ip:${ip}`);
+  if (!ipLimit.allowed) return jsonResponse({ error: 'Too many login attempts from this network. Please try again later.' }, 429);
 
-const userKey = `user:${username}`;
-const userData = await env.KV.get(userKey, 'json');
-if (!userData) return jsonResponse({ error: 'Invalid credentials' }, 401);
+  let body;
+  try { body = await request.json(); } catch { return jsonResponse({ error: 'Invalid request body' }, 400); }
+  const { username, password } = body || {};
+  if (!username || !password || typeof username !== 'string' || typeof password !== 'string') {
+    return jsonResponse({ error: 'Missing credentials' }, 400);
+  }
+  const userLimit = await checkAuthRateLimit(env, `login:user:${username}`);
+  if (!userLimit.allowed) return jsonResponse({ error: 'Too many failed attempts for this account. Please try again later.' }, 429);
 
-const hash = await hashPassword(password, username, env);
-if (hash !== userData.passwordHash) return jsonResponse({ error: 'Invalid credentials' }, 401);
+  const userKey = `user:${username}`;
+  const userData = await env.KV.get(userKey, 'json');
+  let salt;
+  if (userData && userData.salt) salt = userData.salt;
+  else if (userData) salt = username;
+  else salt = generateSalt();
+  const hash = await hashPassword(password, salt, env);
 
-const token = await createToken(username, env);
-return jsonResponse({ token });
+  if (!userData || hash !== userData.passwordHash) {
+    await recordAuthFailure(env, ipLimit.rlKey, ipLimit.data);
+    await recordAuthFailure(env, userLimit.rlKey, userLimit.data);
+    return jsonResponse({ error: 'Invalid credentials' }, 401);
+  }
+  if (!userData.salt) {
+    const newSalt = generateSalt();
+    const newHash = await hashPassword(password, newSalt, env);
+    await env.KV.put(userKey, JSON.stringify({ ...userData, passwordHash: newHash, salt: newSalt }));
+  }
+  await recordAuthSuccess(env, ipLimit.rlKey);
+  await recordAuthSuccess(env, userLimit.rlKey);
+  const token = await createToken(username, env);
+  return jsonResponse({ token });
 }
 
 
@@ -1409,7 +2138,6 @@ html[dir="rtl"] .export-menu button { text-align: right; }
   border: 1px solid var(--border);
   padding: 8px 14px;
   text-align: left;
-  /* Increased from 80px to 120px so columns like "Meaning" don't get squished */
   min-width: 120px;
   word-break: break-word;
 }
@@ -1418,7 +2146,6 @@ html[dir="rtl"] .export-menu button { text-align: right; }
   background: var(--surface);
   font-weight: 600;
   color: var(--accent);
-  /* Prevents headers from wrapping, keeping them nicely aligned */
   white-space: nowrap; 
 }
 
@@ -1534,10 +2261,6 @@ html[dir="rtl"] .export-menu button { text-align: right; }
 .edit-message-actions button { padding: 6px 14px; border-radius: var(--radius-sm); font-size: 12px; cursor: pointer; border: 1px solid var(--border); background: var(--surface-strong); color: var(--text); }
 .edit-message-actions button.save-edit-btn { background: var(--accent); color: #000; border-color: var(--accent); font-weight: 600; }
 
-/* ---------- Generation control bar (Stop / Resume) ---------- */
-/* Improvement 3: modernized pill button with smooth hover/press motion, */
-/* rounded corners, refined spacing/typography — consistent with the app's */
-/* accent-driven design language, and responsive across desktop/mobile.  */
 .gen-controls-wrap { display: flex; justify-content: center; padding: 10px 0 4px; animation: fadeIn 0.2s ease; }
 .gen-control-btn {
   display: flex; align-items: center; gap: 9px;
@@ -1589,12 +2312,12 @@ html[dir="rtl"] .export-menu button { text-align: right; }
 .upload-btn:hover { color: var(--accent); background: rgba(255,255,255,0.05); }
 
 .web-search-btn {
-  height: 44px; width: 44px; min-width: 44px; /* Fixed width forces a perfect circle */
+  height: 44px; width: 44px; min-width: 44px;
   border: 1px solid transparent; background: transparent; color: var(--text-muted);
-  border-radius: 50%; /* Perfect circle when collapsed */
-  cursor: pointer; display: flex; align-items: center; justify-content: center; /* Centers the globe icon */
+  border-radius: 50%;
+  cursor: pointer; display: flex; align-items: center; justify-content: center;
   flex-shrink: 0; padding: 0; 
-  margin: 0 8px; /* <--- CRUCIAL: Adds breathing room between the button and the text input */
+  margin: 0 8px;
   font-family: var(--font-main); font-size: 13px; font-weight: 500;
   transition: width 0.25s ease, padding 0.25s ease, border-radius 0.2s ease, background 0.2s ease, color 0.2s ease, border-color 0.2s ease, transform 0.15s ease;
 }
@@ -1608,8 +2331,8 @@ html[dir="rtl"] .export-menu button { text-align: right; }
 .web-search-btn:active { transform: scale(0.96); }
 
 .web-search-btn.active {
-  width: auto; min-width: auto; /* Expands to fit the text */
-  border-radius: 22px; /* Becomes a pill shape again when active */
+  width: auto; min-width: auto;
+  border-radius: 22px;
   padding: 0 16px; 
   color: #000; background: var(--accent); border-color: var(--accent);
   box-shadow: 0 2px 10px color-mix(in srgb, var(--accent) 35%, transparent);
@@ -1696,17 +2419,12 @@ html[dir="rtl"] .export-menu button { text-align: right; }
 .modal-content input:focus { border-color: var(--accent); }
 .modal-content button { width: 100%; height: 48px; background: var(--accent); color: #000; border: none; font-weight: 600; text-transform: uppercase; letter-spacing: 1px; border-radius: var(--radius-sm); cursor: pointer; }
 
-/* =============================================
-   MEMORY MANAGER
-   ============================================= */
 #memoryModal {
   position: fixed; inset: 0; background: rgba(0,0,0,0.7); backdrop-filter: blur(8px);
   display: none; z-index: 1001; padding: 20px;
-  /* Explicit centering rules for desktop */
   justify-content: center; 
   align-items: center;      
 }
-/* Keep this right below it */
 #memoryModal[style*="flex"] { display: flex !important; justify-content: center !important; align-items: center !important; }
 
 .mem-panel {
@@ -1849,8 +2567,8 @@ html[dir="rtl"] .export-menu button { text-align: right; }
 .mem-add-btn:active { transform: scale(0.95); }
 
 .mem-close {
-flex-shrink: 0;          /* Prevent it from being squeezed */
-  min-width: 120px;        /* Always at least this wide */
+  flex-shrink: 0;
+  min-width: 120px;
   width: auto;
   margin: 12px 20px 16px; height: 38px;
   background: var(--surface-strong); border: 1px solid var(--border);
@@ -1929,23 +2647,6 @@ html[dir="rtl"] .copy-code-btn { right: auto; left: 6px; }
   .topbar { padding: 0 16px; height: 50px; }
   .brand-text strong { display: none; } 
   .sidebar { position: fixed; left: 0; top: 50px; bottom: 0; width: 260px; transform: translateX(-100%); z-index: 30; padding: 16px; border-right: none; box-shadow: 2px 0 10px rgba(0,0,0,0.5); }
-  /* Mobile fix for Memory Manager dropdown overflow */
-@media (max-width: 768px) {
-  .mem-toolbar {
-    padding: 12px 12px 0; /* Reduce the side padding to gain extra space */
-    gap: 4px; /* Slightly tighten the gap between the elements */
-  }
-  .mem-search {
-    flex: 1;
-    min-width: 0; /* Crucial: Lets the search box shrink down if space is tight */
-  }
-  .mem-sort {
-    max-width: 110px; /* Prevents the dropdown from growing wider than this */
-    padding: 0 22px 0 8px; /* Reduces internal padding to save space */
-    font-size: 11px; /* Slightly smaller text to fit safely */
-    background-position: right 6px center; /* Keeps the arrow aligned */
-  }
-}
   .sidebar.open { transform: translateX(0); }
   .sidebar.collapsed { width: 260px; padding: 16px; }
   .overlay { display: none; position: fixed; inset: 0; top: 50px; background: rgba(0,0,0,0.6); z-index: 25; }
@@ -1979,6 +2680,24 @@ html[dir="rtl"] .copy-code-btn { right: auto; left: 6px; }
   .jump-bottom-btn { bottom: 90px; }
   .copy-code-btn { opacity: 1; }
   .gen-control-btn { padding: 9px 16px; font-size: 12.5px; gap: 7px; }
+}
+
+/* Un-nested mobile Memory Manager rule */
+@media (max-width: 768px) {
+  .mem-toolbar {
+    padding: 12px 12px 0;
+    gap: 4px;
+  }
+  .mem-search {
+    flex: 1;
+    min-width: 0;
+  }
+  .mem-sort {
+    max-width: 110px;
+    padding: 0 22px 0 8px;
+    font-size: 11px;
+    background-position: right 6px center;
+  }
 }
 
 @media (max-width: 380px) {
@@ -2037,7 +2756,6 @@ html[dir="rtl"] .copy-code-btn { right: auto; left: 6px; }
 </div>
 </div>
 
-<!-- Drag & drop overlay -->
 <div class="drop-overlay" id="dropOverlay">
   <div class="drop-overlay-inner">
     <i class="fas fa-cloud-arrow-up"></i>
@@ -2045,7 +2763,6 @@ html[dir="rtl"] .copy-code-btn { right: auto; left: 6px; }
   </div>
 </div>
 
-<!-- Memory Manager Modal -->
 <div id="memoryModal">
   <div class="mem-panel">
     <div class="mem-head">
@@ -2087,9 +2804,6 @@ html[dir="rtl"] .copy-code-btn { right: auto; left: 6px; }
 
 <script> // ---------- AUTH SETUP ---------- const authScreen = document.getElementById('authScreen'); const appContainer = document.getElementById('appContainer'); const authUsername = document.getElementById('authUsername'); const authPassword = document.getElementById('authPassword'); const authError = document.getElementById('authError'); const continueBtn = document.getElementById('continueBtn'); const usernameDisplay = document.getElementById('usernameDisplay'); const logoutBtn = document.getElementById('logoutBtn');
 
-// ============================================================
-// ---------- I18N / TRANSLATION SYSTEM ----------
-// ============================================================
 const translations = {
   en: {
     authTitle: "System Authentication", authSubtitle: "Welcome back", usernameLabel: "Username", usernamePlaceholder: "Enter your username",
@@ -2155,7 +2869,6 @@ function applyTranslations() {
 }
 function setLanguage(lang) { if (lang !== 'en' && lang !== 'fa') lang = 'en'; currentLang = lang; localStorage.setItem('language', lang); applyTranslations(); }
 
-// ---------- CHAT LOGIC VARIABLES (declared first) ----------
 let currentConversationId = localStorage.getItem('currentConversationId') || null;
 let conversationsCache = [];
 let currentMessages = [];
@@ -2166,13 +2879,28 @@ let userNearBottom = true;
 let isStreamingActive = false;
 let jumpBottomBtn = null;
 
-// API wrapper – automatically attaches token and handles 401
 async function api(url, options = {}) {
   const headers = { 'Content-Type': 'application/json', ...options.headers };
   if (token) headers['Authorization'] = \`Bearer \${token}\`;
   const res = await fetch(url, { ...options, headers });
   if (res.status === 401) { logout(); throw new Error('Session expired'); }
   return res;
+}
+const attachmentObjectUrlCache = new Map();
+async function setImageSrc(imgEl, src) {
+  if (!src || !src.startsWith('/api/attachments/')) { imgEl.src = src; return; }
+  if (attachmentObjectUrlCache.has(src)) { imgEl.src = attachmentObjectUrlCache.get(src); return; }
+  try {
+    const res = await api(src);
+    if (!res.ok) throw new Error('Failed to load image');
+    const blob = await res.blob();
+    const objectUrl = URL.createObjectURL(blob);
+    attachmentObjectUrlCache.set(src, objectUrl);
+    imgEl.src = objectUrl;
+  } catch (err) {
+    console.error('Image load error:', err);
+    imgEl.alt = 'Image unavailable';
+  }
 }
 function logout() {
   localStorage.removeItem('token'); localStorage.removeItem('username');
@@ -2212,7 +2940,6 @@ continueBtn.addEventListener('click', handleContinue);
 authPassword.addEventListener('keydown', (e) => { if (e.key === 'Enter') handleContinue(); });
 authUsername.addEventListener('keydown', (e) => { if (e.key === 'Enter') authPassword.focus(); });
 
-// ---------- THEME & SIDEBAR ----------
 const html = document.documentElement;
 const storedTheme = localStorage.getItem('theme');
 if (storedTheme) html.dataset.theme = storedTheme;
@@ -2224,7 +2951,6 @@ themeDarkBtn.addEventListener('click', () => setTheme('dark'));
 themeLightBtn.addEventListener('click', () => setTheme('light'));
 syncThemeButtons();
 
-// ---------- SETTINGS MENU ----------
 const settingsToggleBtn = document.getElementById('settingsToggleBtn');
 const settingsMenu = document.getElementById('settingsMenu');
 const settingsLogoutBtn = document.getElementById('settingsLogoutBtn');
@@ -2232,7 +2958,6 @@ settingsToggleBtn.addEventListener('click', (e) => { e.stopPropagation(); settin
 document.addEventListener('click', (e) => { if (settingsMenu.classList.contains('open') && !settingsMenu.contains(e.target) && e.target !== settingsToggleBtn) { settingsMenu.classList.remove('open'); } });
 settingsLogoutBtn.addEventListener('click', () => { settingsMenu.classList.remove('open'); logout(); });
 
-// ---------- LANGUAGE TOGGLES ----------
 const authLangToggleEl = document.getElementById('authLangToggle');
 const settingsLangToggleEl = document.getElementById('settingsLangToggle');
 [authLangToggleEl, settingsLangToggleEl].forEach(toggle => {
@@ -2240,27 +2965,16 @@ const settingsLangToggleEl = document.getElementById('settingsLangToggle');
   toggle.querySelectorAll('[data-lang-btn]').forEach(btn => { btn.addEventListener('click', () => setLanguage(btn.getAttribute('data-lang-btn'))); });
 });
 
-// ---------- SIDEBAR TOGGLE (works on every screen size) ----------
 const sidebar = document.getElementById('sidebar');
 const sidebarToggle = document.getElementById('sidebarToggle');
 const overlay = document.getElementById('overlay');
 function isMobileViewport() { return window.innerWidth <= 768; }
-function openSidebar() {
-  if (isMobileViewport()) { sidebar.classList.add('open'); overlay.classList.add('show'); }
-  else { sidebar.classList.remove('collapsed'); }
-}
-function closeSidebar() {
-  if (isMobileViewport()) { sidebar.classList.remove('open'); overlay.classList.remove('show'); }
-  else { sidebar.classList.add('collapsed'); }
-}
+function openSidebar() { if (isMobileViewport()) { sidebar.classList.add('open'); overlay.classList.add('show'); } else { sidebar.classList.remove('collapsed'); } }
+function closeSidebar() { if (isMobileViewport()) { sidebar.classList.remove('open'); overlay.classList.remove('show'); } else { sidebar.classList.add('collapsed'); } }
 function isSidebarOpen() { return isMobileViewport() ? sidebar.classList.contains('open') : !sidebar.classList.contains('collapsed'); }
 sidebarToggle.addEventListener('click', () => isSidebarOpen() ? closeSidebar() : openSidebar());
 overlay.addEventListener('click', closeSidebar);
-window.addEventListener('resize', () => {
-  // Reset transient state when crossing the mobile/desktop breakpoint so the
-  // sidebar doesn't get stuck open off-screen or collapsed with no way back.
-  sidebar.classList.remove('open'); sidebar.classList.remove('collapsed'); overlay.classList.remove('show');
-});
+window.addEventListener('resize', () => { sidebar.classList.remove('open'); sidebar.classList.remove('collapsed'); overlay.classList.remove('show'); });
 
 const messagesContainer = document.getElementById('messagesContainer');
 const userInput = document.getElementById('userInput');
@@ -2269,20 +2983,13 @@ const conversationListEl = document.getElementById('conversationList');
 const newChatBtn = document.getElementById('newChatBtn');
 applyTranslations();
 
-// ---------- WEB SEARCH TOGGLE ----------
-// When on, every chat request asks the backend to run a Tavily web search
-// before generating the answer. State persists across reloads like theme.
 const webSearchBtn = document.getElementById('webSearchBtn');
 const webSearchToast = document.getElementById('webSearchToast');
 const webSearchToastText = document.getElementById('webSearchToastText');
 let webSearchEnabled = localStorage.getItem('webSearchEnabled') === 'true';
 let webSearchToastTimer = null;
 function syncWebSearchBtn() { webSearchBtn.classList.toggle('active', webSearchEnabled); }
-webSearchBtn.addEventListener('click', () => {
-  webSearchEnabled = !webSearchEnabled;
-  localStorage.setItem('webSearchEnabled', String(webSearchEnabled));
-  syncWebSearchBtn();
-});
+webSearchBtn.addEventListener('click', () => { webSearchEnabled = !webSearchEnabled; localStorage.setItem('webSearchEnabled', String(webSearchEnabled)); syncWebSearchBtn(); });
 syncWebSearchBtn();
 function showWebSearchToast(msg) {
   webSearchToastText.innerHTML = '<i class="fas fa-triangle-exclamation" style="color:#f59e0b"></i> ' + msg;
@@ -2291,20 +2998,29 @@ function showWebSearchToast(msg) {
   webSearchToastTimer = setTimeout(() => { webSearchToast.classList.remove('on'); }, 4500);
 }
 
-// ---------- IMAGE UPLOAD ELEMENTS ----------
 const uploadBtn = document.getElementById('uploadBtn');
 const fileInput = document.getElementById('fileInput');
 const imagePreviewContainer = document.getElementById('imagePreviewContainer');
 let attachedImages = [];
 const ACCEPTED_IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/jpg', 'image/gif', 'image/webp'];
+const MAX_IMAGES_PER_MESSAGE_CLIENT = 6;
+const MAX_IMAGE_BYTES_CLIENT = 5 * 1024 * 1024;
 uploadBtn.addEventListener('click', () => fileInput.click());
 function readImageFiles(fileList) {
   const files = Array.from(fileList).filter(f => ACCEPTED_IMAGE_TYPES.includes(f.type));
+  const rejected = [];
   files.forEach(file => {
+    if (attachedImages.length >= MAX_IMAGES_PER_MESSAGE_CLIENT) { rejected.push(file.name + ' (too many images)'); return; }
+    if (file.size > MAX_IMAGE_BYTES_CLIENT) { rejected.push(file.name + ' (over 5MB)'); return; }
     const reader = new FileReader();
-    reader.onload = (event) => { const base64 = event.target.result; attachedImages.push({ name: file.name, base64 }); renderImagePreviews(); };
+    reader.onload = (event) => {
+      if (attachedImages.length >= MAX_IMAGES_PER_MESSAGE_CLIENT) return;
+      const base64 = event.target.result; attachedImages.push({ name: file.name, base64 }); renderImagePreviews();
+    };
+    reader.onerror = () => { rejected.push(file.name + ' (could not be read)'); };
     reader.readAsDataURL(file);
   });
+  if (rejected.length) { showWebSearchToast('Skipped: ' + rejected.join(', ')); }
 }
 fileInput.addEventListener('change', (e) => { readImageFiles(e.target.files); fileInput.value = ''; });
 function renderImagePreviews() {
@@ -2318,7 +3034,6 @@ function renderImagePreviews() {
   });
 }
 
-// ---------- DRAG & DROP IMAGE UPLOAD ----------
 const dropOverlay = document.getElementById('dropOverlay');
 let dragCounter = 0;
 function containsFiles(e) { return e.dataTransfer && Array.from(e.dataTransfer.types || []).includes('Files'); }
@@ -2401,7 +3116,6 @@ function appendUserActions(msgDiv, content, messageIndex) {
   setTimeout(() => actionsDiv.classList.add('visible'), 50);
 }
 
-// ---------- EDIT MESSAGE (ChatGPT-style: edit -> truncate -> regenerate) ----------
 function startEditMessage(msgDiv, content, messageIndex) {
   if (isGenerating) return;
   const originalHTML = msgDiv.innerHTML;
@@ -2420,10 +3134,8 @@ function startEditMessage(msgDiv, content, messageIndex) {
 }
 function autoGrowEditTextarea(ta) { ta.style.height = 'auto'; ta.style.height = ta.scrollHeight + 'px'; }
 async function commitMessageEdit(messageIndex, newContent) {
-  // Editing a message invalidates any pending "Continue generating" state for
-  // content after this point, since that content is about to be discarded.
   removeGenControls();
-  lastPartialReply = ""; lastPartialAiIndex = null; lastPartialUserMessage = null;
+  lastPartialReply = ""; lastPartialAiIndex = null; lastPartialUserMessage = null; currentGenerationId = null;
   const images = currentMessages[messageIndex] ? currentMessages[messageIndex].images : [];
   currentMessages = currentMessages.slice(0, messageIndex);
   currentMessages.push({ role: 'user', content: newContent, created_at: Date.now(), images: images || [] });
@@ -2432,7 +3144,6 @@ async function commitMessageEdit(messageIndex, newContent) {
   await sendMessageProgrammatically(newContent);
 }
 
-// Wrap every <pre> in a code-block container with a copy button
 function attachCodeCopyButtons(container) {
   const pres = container.querySelectorAll('pre');
   pres.forEach((pre) => {
@@ -2469,6 +3180,18 @@ function hideJumpBottom() { if (jumpBottomBtn) jumpBottomBtn.classList.remove('s
 function isNearBottom() { const threshold = 100; return (messagesContainer.scrollHeight - messagesContainer.scrollTop - messagesContainer.clientHeight) < threshold; }
 messagesContainer.addEventListener('scroll', () => { const near = isNearBottom(); userNearBottom = near; if (near || !isStreamingActive) hideJumpBottom(); }, { passive: true });
 
+// Safe markdown rendering: if marked or DOMPurify failed to load, return
+// null so callers fall back to plain text (never trigger reconnect polling).
+function safeRenderMarkdown(text) {
+  try {
+    if (typeof marked === 'undefined' || typeof DOMPurify === 'undefined') return null;
+    return DOMPurify.sanitize(marked.parse(text));
+  } catch (e) {
+    console.error('Markdown render error:', e);
+    return null;
+  }
+}
+
 function addMessageToUI(role, content, isMarkdown = false, messageIndex = null, skipActions = false, images = []) {
   const msgDiv = document.createElement('div'); msgDiv.className = 'message ' + role;
   if (messageIndex !== null) msgDiv.dataset.index = messageIndex;
@@ -2478,12 +3201,20 @@ function addMessageToUI(role, content, isMarkdown = false, messageIndex = null, 
     if (images && images.length > 0) {
       const imgContainer = document.createElement('div');
       imgContainer.style.display = 'flex'; imgContainer.style.flexWrap = 'wrap'; imgContainer.style.gap = '8px'; imgContainer.style.marginTop = '10px';
-      images.forEach(src => { const img = document.createElement('img'); img.src = src; img.style.maxWidth = '200px'; img.style.maxHeight = '200px'; img.style.borderRadius = 'var(--radius-sm)'; img.style.border = '1px solid var(--border)'; imgContainer.appendChild(img); });
+      images.forEach(src => { const img = document.createElement('img'); img.style.maxWidth = '200px'; img.style.maxHeight = '200px'; img.style.borderRadius = 'var(--radius-sm)'; img.style.border = '1px solid var(--border)'; setImageSrc(img, src); imgContainer.appendChild(img); });
       msgDiv.appendChild(imgContainer);
     }
     if (!skipActions) appendUserActions(msgDiv, content, messageIndex);
   } else {
-    if (content) { msgDiv.innerHTML = DOMPurify.sanitize(marked.parse(content)); attachCodeCopyButtons(msgDiv); }
+    if (content) {
+      const html = safeRenderMarkdown(content);
+      if (html !== null) {
+        msgDiv.innerHTML = html;
+        attachCodeCopyButtons(msgDiv);
+      } else {
+        msgDiv.textContent = content;
+      }
+    }
     if (!skipActions && content) appendActions(msgDiv, content, messageIndex);
   }
   const emptyState = messagesContainer.querySelector('.empty-state'); if (emptyState) emptyState.remove();
@@ -2491,17 +3222,28 @@ function addMessageToUI(role, content, isMarkdown = false, messageIndex = null, 
   setTimeout(() => { messagesContainer.scrollTop = messagesContainer.scrollHeight; }, 10);
   return msgDiv;
 }
+
 function renderAllMessages() {
-  messagesContainer.innerHTML = ''; hideJumpBottom();
-  if (!currentMessages.length) { showEmptyState(); return; }
-  currentMessages.forEach((msg, idx) => { addMessageToUI(msg.role, msg.content, msg.role === 'assistant', idx, false, msg.images || []); });
+  try {
+    messagesContainer.innerHTML = ''; hideJumpBottom();
+    if (!currentMessages.length) { showEmptyState(); return; }
+    currentMessages.forEach((msg, idx) => { addMessageToUI(msg.role, msg.content, msg.role === 'assistant', idx, false, msg.images || []); });
+  } catch (err) {
+    console.error('renderAllMessages error, falling back to plain text:', err);
+    messagesContainer.innerHTML = '';
+    currentMessages.forEach((msg) => {
+      const div = document.createElement('div');
+      div.className = 'message ' + (msg.role || 'assistant');
+      div.textContent = msg.content || '';
+      messagesContainer.appendChild(div);
+    });
+  }
 }
+
 async function deleteMessagePair(aiIndex) {
   if (aiIndex >= currentMessages.length || currentMessages[aiIndex].role !== 'assistant') return;
-  // Deleting a message invalidates any pending "Continue generating" state,
-  // since the underlying message array is about to be restructured.
   removeGenControls();
-  lastPartialReply = ""; lastPartialAiIndex = null; lastPartialUserMessage = null;
+  lastPartialReply = ""; lastPartialAiIndex = null; lastPartialUserMessage = null; currentGenerationId = null;
   if (aiIndex - 1 >= 0 && currentMessages[aiIndex - 1].role === 'user') {
     userInput.value = currentMessages[aiIndex - 1].content; autoResizeTextarea();
     currentMessages = currentMessages.slice(0, aiIndex - 1);
@@ -2514,36 +3256,42 @@ async function regenerateMessage(aiIndex) {
   if (isGenerating) return;
   if (aiIndex >= currentMessages.length || currentMessages[aiIndex].role !== 'assistant' || aiIndex - 1 < 0) return;
   removeGenControls();
-  lastPartialReply = ""; lastPartialAiIndex = null; lastPartialUserMessage = null;
+  lastPartialReply = ""; lastPartialAiIndex = null; lastPartialUserMessage = null; currentGenerationId = null;
   const userMessage = currentMessages[aiIndex - 1].content;
   const oldMsg = currentMessages[aiIndex];
   const priorVariants = (oldMsg.variants && oldMsg.variants.length) ? oldMsg.variants : [oldMsg.content];
   currentMessages = currentMessages.slice(0, aiIndex);
   renderAllMessages();
+  await updateMessagesOnServer(currentMessages);
   await sendMessageProgrammatically(userMessage, { regenerateVariants: priorVariants });
 }
 
-// ---------- STOP / CONTINUE GENERATION ----------
 let activeAbortController = null;
+let currentGenerationId = null;
 let lastPartialReply = "";
 let lastPartialAiIndex = null;
 let lastPartialUserMessage = null;
 let genControlsEl = null;
+let reconnectAbortController = null;
 function removeGenControls() { if (genControlsEl && genControlsEl.parentNode) genControlsEl.parentNode.removeChild(genControlsEl); genControlsEl = null; }
 function showStopControl() {
   removeGenControls();
   genControlsEl = document.createElement('div'); genControlsEl.className = 'gen-controls-wrap';
   const btn = document.createElement('button'); btn.type = 'button'; btn.className = 'gen-control-btn stop-btn';
   btn.innerHTML = '<span class="stop-icon"></span><span>' + t('stopGenerating') + '</span>';
-  btn.addEventListener('click', () => { if (activeAbortController) activeAbortController.abort(); });
+  btn.addEventListener('click', () => {
+    if (currentGenerationId && currentConversationId) {
+      api('/api/chat/cancel', { method: 'POST', body: JSON.stringify({ conversationId: currentConversationId, generationId: currentGenerationId }) }).catch(() => {});
+    }
+    if (activeAbortController) activeAbortController.abort();
+    if (reconnectAbortController) reconnectAbortController.abort();
+  });
   genControlsEl.appendChild(btn);
   messagesContainer.parentNode.insertBefore(genControlsEl, messagesContainer.nextSibling);
 }
 function showContinueControl() {
   removeGenControls();
   genControlsEl = document.createElement('div'); genControlsEl.className = 'gen-controls-wrap';
-  // Improvement 3: distinct "continue" styling (accent gradient pill) so the
-  // resumable state reads clearly as an actionable, inviting control.
   const btn = document.createElement('button'); btn.type = 'button'; btn.className = 'gen-control-btn continue-btn';
   btn.innerHTML = '<i class="fas fa-play"></i><span>' + t('continueGenerating') + '</span>';
   btn.addEventListener('click', async () => { removeGenControls(); await continueGeneration(); });
@@ -2556,38 +3304,40 @@ async function continueGeneration() {
   await sendMessageProgrammatically(continuationPrompt, { continuation: true, aiIndex: lastPartialAiIndex });
 }
 
-// Polls the server for a reply that's still generating in the background
-// (the worker keeps going via ctx.waitUntil even if this device drops the
-// connection). Resolves with the finished messages array once done, or
-// null if it times out.
 async function waitForBackgroundReply(conversationId, { timeoutMs = 120000, intervalMs = 2500 } = {}) {
+  reconnectAbortController = new AbortController();
+  const signal = reconnectAbortController.signal;
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
+    if (signal.aborted) return { messages: null, aborted: true };
     await new Promise(r => setTimeout(r, intervalMs));
+    if (signal.aborted) return { messages: null, aborted: true };
     try {
       const pendingRes = await api('/api/chat/pending?conversationId=' + encodeURIComponent(conversationId));
       const pendingData = pendingRes.ok ? await pendingRes.json() : { pending: false };
       if (!pendingData.pending) {
+        if (pendingData.status === 'failed') {
+          return { messages: null, error: pendingData.error || 'Generation failed on the server.' };
+        }
+        if (pendingData.status === 'cancelled') {
+          return { messages: null, cancelled: true };
+        }
         const msgRes = await api('/api/messages?conversationId=' + encodeURIComponent(conversationId));
-        if (msgRes.ok) { const msgData = await msgRes.json(); return msgData.messages || []; }
-        return null;
+        if (msgRes.ok) { const msgData = await msgRes.json(); return { messages: msgData.messages || [] }; }
+        return { messages: null, error: 'Could not load messages after generation.' };
       }
-    } catch (e) { /* still flaky — keep retrying until timeout */ }
+    } catch (e) { /* keep retrying until timeout */ }
   }
-  return null;
+  return { messages: null, error: 'Timed out waiting for the background reply.' };
 }
 
 async function sendMessageProgrammatically(message, opts = {}) {
-if (!currentConversationId || isGenerating) return;
+  if (!currentConversationId || isGenerating) return;
   isGenerating = true; isStreamingActive = true; userNearBottom = true; sendBtn.disabled = true; hideJumpBottom();
 
   let msgDiv; let accumulatedText = ""; let aiIndex;
   if (opts.continuation && opts.aiIndex !== null && opts.aiIndex !== undefined) {
     aiIndex = opts.aiIndex;
-    // ---- IMPROVEMENT 1: resume into the SAME assistant bubble ----
-    // Find the existing assistant message element by its data-index (set when
-    // it was first created) so streaming continues in place instead of
-    // spawning a second, duplicate assistant message.
     msgDiv = messagesContainer.querySelector('.message.ai[data-index="' + aiIndex + '"], .message.assistant[data-index="' + aiIndex + '"]');
     if (!msgDiv) { msgDiv = document.createElement('div'); msgDiv.className = 'message ai'; messagesContainer.appendChild(msgDiv); }
     msgDiv.dataset.index = aiIndex;
@@ -2597,9 +3347,6 @@ if (!currentConversationId || isGenerating) return;
     const emptyState = messagesContainer.querySelector('.empty-state'); if (emptyState) emptyState.remove();
     messagesContainer.appendChild(msgDiv);
     aiIndex = currentMessages.length;
-    // Tag the bubble with its (future) message index right away so that a
-    // later "Continue generating" click can locate and reuse this exact
-    // element instead of creating a duplicate one.
     msgDiv.dataset.index = aiIndex;
   }
   const useWebSearch = webSearchEnabled && !opts.continuation;
@@ -2610,31 +3357,65 @@ if (!currentConversationId || isGenerating) return;
   showStopControl();
 
   let renderScheduled = false;
-let renderFrameId = null; 
-function renderMarkdownFrame() {
-  msgDiv.innerHTML = DOMPurify.sanitize(marked.parse(accumulatedText));
-  if (isRTLText(accumulatedText) && !msgDiv.classList.contains('rtl')) { msgDiv.classList.add('rtl'); }
-  attachCodeCopyButtons(msgDiv);
-  if (userNearBottom) { messagesContainer.scrollTop = messagesContainer.scrollHeight; } else { showJumpBottom(); }
-}
-function scheduleRender() {
-  if (renderScheduled) return;
-  renderScheduled = true;
-  renderFrameId = requestAnimationFrame(() => {
-    renderScheduled = false;
-    renderFrameId = null;
-    renderMarkdownFrame();
-  });
-}
+  let renderFrameId = null;
+  function renderMarkdownFrame() {
+    const html = safeRenderMarkdown(accumulatedText);
+    if (html !== null) {
+      msgDiv.innerHTML = html;
+    } else {
+      msgDiv.textContent = accumulatedText;
+    }
+    if (isRTLText(accumulatedText) && !msgDiv.classList.contains('rtl')) { msgDiv.classList.add('rtl'); }
+    try { attachCodeCopyButtons(msgDiv); } catch (e) {}
+    if (userNearBottom) { messagesContainer.scrollTop = messagesContainer.scrollHeight; } else { showJumpBottom(); }
+  }
+  function scheduleRender() {
+    if (renderScheduled) return;
+    renderScheduled = true;
+    renderFrameId = requestAnimationFrame(() => {
+      renderScheduled = false;
+      renderFrameId = null;
+      renderMarkdownFrame();
+    });
+  }
 
   activeAbortController = new AbortController();
+  currentGenerationId = null;
   let wasAborted = false;
+  const thisRequestId = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random());
+
+  let idleTimer = null;
+  function resetIdleTimer() {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      if (activeAbortController && !activeAbortController.signal.aborted) {
+        activeAbortController.abort();
+      }
+    }, 45000);
+  }
+
   try {
+    resetIdleTimer();
     const res = await api('/api/chat', {
       method: 'POST',
       signal: activeAbortController.signal,
-      body: JSON.stringify({ message, conversationId: currentConversationId, messages: currentMessages, webSearchEnabled: useWebSearch })
+      body: JSON.stringify({
+        message,
+        conversationId: currentConversationId,
+        messages: currentMessages,
+        webSearchEnabled: useWebSearch,
+        requestId: thisRequestId,
+        continuation: !!opts.continuation,
+      })
     });
+    if (res.status === 409) {
+      const conflictData = await res.json().catch(() => ({}));
+      const result = await waitForBackgroundReply(currentConversationId);
+      if (result.messages) { currentMessages = result.messages; renderAllMessages(); }
+      else if (result.error) { throw new Error(result.error); }
+      else { throw new Error(conflictData.error || "A response is already generating for this conversation."); }
+      return;
+    }
     if (!res.ok) { const errData = await res.json().catch(() => ({ error: "Server error" })); throw new Error(errData.error || "Network fault"); }
 
     const reader = res.body.getReader();
@@ -2646,6 +3427,7 @@ function scheduleRender() {
       catch (readErr) { if (activeAbortController.signal.aborted) { wasAborted = true; break; } throw readErr; }
       const { done, value } = readResult;
       if (done) break;
+      resetIdleTimer();
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\\n'); buffer = lines.pop() || "";
       for (const line of lines) {
@@ -2654,30 +3436,34 @@ function scheduleRender() {
           if (jsonStr === '[DONE]' || !jsonStr) continue;
           try {
             const parsed = JSON.parse(jsonStr);
+            if (parsed.generationId) { currentGenerationId = parsed.generationId; }
             if (parsed.notice) { showWebSearchToast(parsed.notice); }
-            if (parsed.response) { accumulatedText += parsed.response; scheduleRender(); }
+            if (typeof parsed.response === 'string') { accumulatedText += parsed.response; scheduleRender(); }
+            else if (parsed.choices && parsed.choices[0]) {
+              const delta = parsed.choices[0].delta;
+              if (delta && typeof delta.content === 'string') { accumulatedText += delta.content; scheduleRender(); }
+              else if (delta && typeof delta.content === 'number') { accumulatedText += String(delta.content); scheduleRender(); }
+              else if (typeof parsed.choices[0].text === 'string') { accumulatedText += parsed.choices[0].text; scheduleRender(); }
+            }
           } catch (e) {}
         }
       }
       if (activeAbortController.signal.aborted) { wasAborted = true; try { await reader.cancel(); } catch (e2) {} break; }
     }
-    
-    renderScheduled = false;
-// Cancel any pending animation frame to prevent it from wiping out the buttons!
-if (renderFrameId) {
-  cancelAnimationFrame(renderFrameId);
-  renderFrameId = null;
-}
-renderMarkdownFrame(); // Final guaranteed render
 
-if (wasAborted) {
-  lastPartialReply = accumulatedText; lastPartialAiIndex = aiIndex; lastPartialUserMessage = message;
-  if (accumulatedText) {
-    if (opts.continuation) { currentMessages[aiIndex] = { role: 'assistant', content: accumulatedText, created_at: Date.now() }; }
-    else { currentMessages.push(buildAssistantMsg(accumulatedText, opts)); }
-    await updateMessagesOnServer(currentMessages);
-  }
-  removeGenControls(); showContinueControl();
+    clearTimeout(idleTimer);
+    renderScheduled = false;
+    if (renderFrameId) { cancelAnimationFrame(renderFrameId); renderFrameId = null; }
+    renderMarkdownFrame();
+
+    if (wasAborted) {
+      lastPartialReply = accumulatedText; lastPartialAiIndex = aiIndex; lastPartialUserMessage = message;
+      if (accumulatedText) {
+        if (opts.continuation) { currentMessages[aiIndex] = { role: 'assistant', content: accumulatedText, created_at: Date.now() }; }
+        else { currentMessages.push(buildAssistantMsg(accumulatedText, opts)); }
+        await updateMessagesOnServer(currentMessages);
+      }
+      removeGenControls(); showContinueControl();
     } else {
       removeGenControls();
 
@@ -2695,11 +3481,12 @@ if (wasAborted) {
           appendActions(msgDiv, accumulatedText, aiIndex);
         }
       }
-      lastPartialReply = ""; lastPartialAiIndex = null; lastPartialUserMessage = null;
+      lastPartialReply = ""; lastPartialAiIndex = null; lastPartialUserMessage = null; currentGenerationId = null;
       await loadConversations();
     }
 
   } catch (err) {
+    clearTimeout(idleTimer);
     if (err.name === 'AbortError' || activeAbortController.signal.aborted) {
       lastPartialReply = accumulatedText; lastPartialAiIndex = aiIndex; lastPartialUserMessage = message;
       if (accumulatedText) {
@@ -2709,30 +3496,44 @@ if (wasAborted) {
       }
       removeGenControls(); showContinueControl();
     } else {
-      // Connection dropped (backgrounded/closed app, flaky network, etc).
-      // The worker keeps generating server-side regardless, so wait for it
-      // instead of failing here.
       removeGenControls();
       msgDiv.innerHTML = '<span class="loading-dots">' + t('reconnecting') + '</span>';
       const convIdAtError = currentConversationId;
-      const finishedMessages = await waitForBackgroundReply(convIdAtError);
+      const result = await waitForBackgroundReply(convIdAtError);
       if (currentConversationId === convIdAtError) {
-        if (finishedMessages) {
-          currentMessages = finishedMessages;
+        if (result.aborted) {
+          msgDiv.textContent = accumulatedText || '';
+        } else if (result.messages) {
+          currentMessages = result.messages;
           renderAllMessages();
           await loadConversations();
+        } else if (result.cancelled) {
+          msgDiv.innerHTML = '';
+          addMessageToUI('assistant', '⏹️ Generation was cancelled.', false, null, true);
         } else {
           msgDiv.innerHTML = '';
-          addMessageToUI('assistant', '❌ ' + err.message, false, null, true);
+          const errDiv = document.createElement('div');
+          errDiv.className = 'message ai';
+          errDiv.textContent = '❌ ' + (result.error || err.message) + ' ';
+          const retryBtn = document.createElement('button');
+          retryBtn.type = 'button';
+          retryBtn.className = 'gen-control-btn';
+          retryBtn.style.marginLeft = '10px';
+          retryBtn.style.padding = '6px 14px';
+          retryBtn.style.fontSize = '12px';
+          retryBtn.textContent = t('retry');
+          retryBtn.addEventListener('click', () => { errDiv.remove(); sendMessageProgrammatically(lastPartialUserMessage || message, opts); });
+          errDiv.appendChild(retryBtn);
+          messagesContainer.appendChild(errDiv);
         }
       }
     }
   } finally {
-    isGenerating = false; isStreamingActive = false; sendBtn.disabled = false; hideJumpBottom(); activeAbortController = null;
+    clearTimeout(idleTimer);
+    isGenerating = false; isStreamingActive = false; sendBtn.disabled = false; hideJumpBottom(); activeAbortController = null; reconnectAbortController = null;
   }
 }
 
-// ---------- SEARCH CONVERSATIONS (plain text, backed by /api/search) ----------
 const searchInput = document.getElementById('searchInput');
 const searchClearBtn = document.getElementById('searchClearBtn');
 const searchResultsPanel = document.getElementById('searchResultsPanel');
@@ -2778,7 +3579,6 @@ function closeSearchPanel() { searchResultsPanel.classList.remove('open'); }
 async function runSemanticSearch(query) {
   searchResultsPanel.innerHTML = '<div class="search-result-loading">…</div>'; openSearchPanel();
   try {
-    // Try AI Search first (semantic search via /api/search-ai)
     const aiRes = await api('/api/search-ai', { method: 'POST', body: JSON.stringify({ query }) });
     if (aiRes.ok) {
       const aiData = await aiRes.json();
@@ -2793,7 +3593,6 @@ async function runSemanticSearch(query) {
       }
     }
   } catch (e) {}
-  // Fallback to existing plain-text search
   try {
     const res = await api('/api/search?query=' + encodeURIComponent(query));
     if (!res.ok) { renderSearchResults([], query); return; }
@@ -2813,7 +3612,6 @@ searchInput.addEventListener('focus', () => { if (searchInput.value.trim()) open
 document.addEventListener('click', (e) => { if (!searchResultsPanel.contains(e.target) && e.target !== searchInput) closeSearchPanel(); });
 searchClearBtn.addEventListener('click', () => { searchInput.value = ''; searchClearBtn.classList.remove('show'); closeSearchPanel(); });
 
-// ---------- MEMORY MANAGER ----------
 const memoryModal = document.getElementById('memoryModal');
 const memoryList = document.getElementById('memoryList');
 const autoMemoryToggle = document.getElementById('autoMemoryToggle');
@@ -2999,7 +3797,6 @@ async function addMemoryManually() {
   try { const res = await api('/api/memories', { method: 'POST', body: JSON.stringify({ text }) }); const data = await res.json(); memoriesCache.push(data.memory); memoryAddInput.value = ''; renderMemories(); toastMem('Memory added'); } catch (e) {}
 }
 
-// ---------- EXPORT CHAT ----------
 const exportBtn = document.getElementById('exportBtn');
 const exportMenu = document.getElementById('exportMenu');
 exportBtn.addEventListener('click', (e) => { e.stopPropagation(); exportMenu.classList.toggle('open'); });
@@ -3058,19 +3855,22 @@ async function deleteConversation(id) {
 }
 async function loadConversation(convId) {
   removeGenControls();
-  lastPartialReply = ""; lastPartialAiIndex = null; lastPartialUserMessage = null;
+  lastPartialReply = ""; lastPartialAiIndex = null; lastPartialUserMessage = null; currentGenerationId = null;
   setCurrentConversationId(convId);
-  const res = await api('/api/messages?conversationId=' + encodeURIComponent(convId));
-  const data = await res.json();
-  currentMessages = data.messages || [];
-  renderAllMessages();
+  try {
+    const res = await api('/api/messages?conversationId=' + encodeURIComponent(convId));
+    const data = await res.json();
+    currentMessages = data.messages || [];
+    renderAllMessages();
+  } catch (err) {
+    console.error('loadConversation error:', err);
+    currentMessages = [];
+    showEmptyState();
+  }
   await loadConversations();
   resumeIfStillGenerating(convId);
 }
 
-// If the conversation was left mid-generation (app closed/reopened before
-// the reply finished), quietly check whether the server is still working
-// on it and fill the answer in once ready, instead of leaving it stuck.
 async function resumeIfStillGenerating(convId) {
   if (isGenerating) return;
   if (!currentMessages.length || currentMessages[currentMessages.length - 1].role !== 'user') return;
@@ -3088,9 +3888,9 @@ async function resumeIfStillGenerating(convId) {
   messagesContainer.appendChild(msgDiv);
   messagesContainer.scrollTop = messagesContainer.scrollHeight;
   try {
-    const finishedMessages = await waitForBackgroundReply(convId);
+    const result = await waitForBackgroundReply(convId);
     if (currentConversationId !== convId) return;
-    if (finishedMessages) { currentMessages = finishedMessages; renderAllMessages(); await loadConversations(); }
+    if (result.messages) { currentMessages = result.messages; renderAllMessages(); await loadConversations(); }
     else { msgDiv.remove(); }
   } finally {
     isGenerating = false; sendBtn.disabled = false;
@@ -3098,7 +3898,7 @@ async function resumeIfStillGenerating(convId) {
 }
 async function createNewConversation() {
   removeGenControls();
-  lastPartialReply = ""; lastPartialAiIndex = null; lastPartialUserMessage = null;
+  lastPartialReply = ""; lastPartialAiIndex = null; lastPartialUserMessage = null; currentGenerationId = null;
   const res = await api('/api/conversations', { method: 'POST', body: JSON.stringify({}) });
   const data = await res.json();
   setCurrentConversationId(data.id);
@@ -3112,10 +3912,8 @@ async function sendMessage() {
   const hasImages = attachedImages.length > 0;
   if (!message && !hasImages) return;
   if (isGenerating) return;
-  // Sending a fresh message abandons any pending "Continue generating" state
-  // from a previous, unfinished response.
   removeGenControls();
-  lastPartialReply = ""; lastPartialAiIndex = null; lastPartialUserMessage = null;
+  lastPartialReply = ""; lastPartialAiIndex = null; lastPartialUserMessage = null; currentGenerationId = null;
   if (!currentConversationId) await createNewConversation();
   const imagesToSave = attachedImages.map(i => i.base64);
   if (hasImages) {
