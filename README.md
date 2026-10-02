@@ -3,7 +3,7 @@
 A full-stack AI chat app that runs entirely on **Cloudflare Workers**. One Worker serves the UI and the API; conversations, accounts and long-term memory live in **Workers KV**, images in **R2**, and the model runs on **Workers AI**. No build step, no framework, no separate server.
 
 **Live demo:** https://ai.hossein.my.id
-On the login screen, enter any username and password (no email needed). If the username doesn't exist yet, the account is created for you.
+choose create account if its the first time your using the website signup and whenever you want to go back to your account use login.
 
 ![System AI, main chat view](docs/screenshots/chat-dark.png)
 
