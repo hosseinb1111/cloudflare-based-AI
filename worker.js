@@ -2703,8 +2703,63 @@ html[dir="rtl"] .copy-code-btn { right: auto; left: 6px; }
 @media (max-width: 380px) {
   .message.ai, .message.assistant { font-size: 15px; }
 }
+
+/* ===== Auth: login / sign up ===== */
+.auth-screen { overflow-y: auto; align-items: safe center; padding: max(20px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) max(20px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left)); }
+.auth-card { margin: auto; }
+.auth-tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; padding: 4px; background: var(--bg); border: 1px solid var(--border); border-radius: 12px; margin-bottom: 22px; }
+.auth-tab { height: 40px; border: 0; border-radius: 9px; background: transparent; color: var(--text-muted); font: inherit; font-size: 14px; font-weight: 500; cursor: pointer; transition: background .2s, color .2s; }
+.auth-tab:hover { color: var(--text); }
+.auth-tab[aria-selected="true"] { background: var(--accent); color: #000; font-weight: 600; }
+.auth-tab:focus-visible, .pw-toggle:focus-visible, .auth-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.auth-card .auth-field { margin-bottom: 14px; }
+.auth-card .auth-field input { margin-bottom: 0; }
+.auth-card .auth-field.invalid input { border-color: var(--danger); }
+.auth-card .auth-field.valid input { border-color: color-mix(in srgb, var(--accent) 55%, var(--border)); }
+.auth-hint { font-size: 12px; line-height: 1.4; color: var(--text-muted); margin-top: 6px; min-height: 16px; }
+.auth-field.invalid .auth-hint { color: var(--danger); }
+.pw-wrap { position: relative; }
+.pw-wrap input { padding-inline-end: 52px; }
+.pw-toggle { position: absolute; inset-block: 0; inset-inline-end: 2px; width: 46px; background: none; border: 0; border-radius: 10px; color: var(--text-muted); font-size: 15px; cursor: pointer; }
+.pw-toggle:hover { color: var(--text); }
+.pw-meter { display: flex; gap: 4px; margin-top: 8px; }
+.pw-meter[hidden], .auth-field[hidden] { display: none; }
+.pw-meter i { flex: 1; height: 4px; border-radius: 2px; background: var(--border); transition: background .2s; }
+.pw-meter[data-level="1"] i:nth-child(1) { background: var(--danger); }
+.pw-meter[data-level="2"] i:nth-child(-n+2) { background: #f59e0b; }
+.pw-meter[data-level="3"] i { background: var(--accent); }
+.auth-buttons button { display: inline-flex; align-items: center; justify-content: center; }
+.auth-buttons button.busy::before { content: ""; width: 16px; height: 16px; margin-inline-end: 10px; border: 2px solid #000; border-right-color: transparent; border-radius: 50%; animation: authSpin .7s linear infinite; }
+@keyframes authSpin { to { transform: rotate(360deg); } }
+.auth-switch { text-align: center; font-size: 13px; color: var(--text-muted); margin-top: 16px; }
+.auth-link { background: none; border: 0; padding: 6px 4px; color: var(--text); font: inherit; font-weight: 600; cursor: pointer; text-decoration: underline; text-decoration-color: var(--accent); text-underline-offset: 3px; }
+@media (min-width: 1024px) { .auth-card { max-width: 420px; padding: 40px 36px; } }
+@media (max-width: 400px) { .auth-card { padding: 28px 20px; } }
+
+/* ===== Footer credit ===== */
+.footer-bottom { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 6px; margin-top: 20px; padding-top: 18px; border-top: 1px solid var(--line, var(--border, #ddd5c9)); color: var(--muted, var(--text-muted, #a29a90)); font-size: .7rem; line-height: 1.7; text-align: center; }
+.footer-bottom .heart, .footer-bottom .coffee { display: inline-block; font-size: 1em; line-height: 1; transform-origin: center; }
+.footer-bottom .heart { animation: heart-beat 1.8s ease-in-out infinite; }
+@keyframes heart-beat { 0%, 100% { transform: scale(1); } 15% { transform: scale(1.25); } 30% { transform: scale(1); } 45% { transform: scale(1.15); } }
+.footer-bottom .coffee { animation: coffee-bob 2.6s ease-in-out infinite; }
+@keyframes coffee-bob { 0%, 100% { transform: translateY(0) rotate(0deg); } 40% { transform: translateY(-2px) rotate(-6deg); } 70% { transform: translateY(0) rotate(3deg); } }
+.footer-bottom .credit-name { color: var(--text, #242321); font-weight: 700; }
+.github-link { position: relative; display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px; margin-left: 2px; color: var(--text, #242321); background: var(--fact-bg, var(--surface-strong, #f7f2e9)); border: 1px solid var(--line, var(--border, #ddd5c9)); border-radius: 50%; text-decoration: none; transition: transform .22s ease, background .22s ease, color .22s ease, border-color .22s ease; }
+.github-link::after { content: ""; position: absolute; inset: -9px; }
+.github-link:hover { transform: scale(1.12) translateY(-1px); background: var(--accent, #dc8427); color: #000; border-color: var(--accent, #dc8427); }
+.github-link:active { transform: scale(0.94); }
+.github-link:focus-visible { outline: 2px solid var(--accent, #dc8427); outline-offset: 3px; }
+.github-link svg { display: block; width: 14px; height: 14px; fill: currentColor; }
+@media (max-width: 400px) { .footer-bottom { font-size: .65rem; } }
+@media (min-width: 1024px) { .footer-bottom { font-size: .8rem; margin-top: 28px; padding-top: 22px; } .github-link { width: 30px; height: 30px; } .github-link svg { width: 16px; height: 16px; } }
+@media (prefers-reduced-motion: reduce) {
+  .footer-bottom .heart, .footer-bottom .coffee { animation: none !important; }
+  .github-link { transition: none !important; }
+  .auth-card { animation: none !important; }
+  .auth-tab, .auth-card input, .pw-meter i { transition: none !important; }
+}
 </style> </head> <body>
-<!-- AUTH SCREEN (visible until login) --> <div id="authScreen" class="auth-screen"> <div class="auth-card"> <div class="auth-brand-mark"><i class="fas fa-terminal"></i></div> <h2 data-i18n="authTitle">System Authentication</h2> <p class="auth-subtitle" data-i18n="authSubtitle">Welcome back</p> <label class="auth-field-label" data-i18n="usernameLabel" for="authUsername">Username</label> <input type="text" id="authUsername" data-i18n-placeholder="usernamePlaceholder" placeholder="Username" autocomplete="username"> <label class="auth-field-label" data-i18n="passwordLabel" for="authPassword">Password</label> <input type="password" id="authPassword" data-i18n-placeholder="passwordPlaceholder" placeholder="Password" autocomplete="current-password"> <div class="auth-buttons"> <button id="continueBtn" data-i18n="continueBtn">Continue</button> </div> <div id="authError"></div> <div class="auth-lang-row"> <div class="lang-toggle" id="authLangToggle" data-lang="en"> <div class="lang-toggle-slider"></div> <button type="button" data-lang-btn="en" class="active">EN</button> <button type="button" data-lang-btn="fa">FA</button> </div> </div> </div> </div>
+<!-- AUTH SCREEN (visible until login) --> <div id="authScreen" class="auth-screen"> <div class="auth-card"> <div class="auth-brand-mark"><i class="fas fa-terminal"></i></div> <h2 data-i18n="authTitle">System Authentication</h2> <p class="auth-subtitle" id="authSubtitle"></p> <div class="auth-tabs" role="tablist"> <button type="button" class="auth-tab" id="tabLogin" role="tab" data-mode="login" data-i18n="tabLogin">Log in</button> <button type="button" class="auth-tab" id="tabSignup" role="tab" data-mode="signup" data-i18n="tabSignup">Sign up</button> </div> <form id="authForm" novalidate> <div class="auth-field" id="fieldUser"> <label class="auth-field-label" for="authUsername" data-i18n="usernameLabel">Username</label> <input type="text" id="authUsername" name="username" data-i18n-placeholder="usernamePlaceholder" placeholder="Enter your username" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="next" aria-describedby="hintUser"> <div class="auth-hint" id="hintUser"></div> </div> <div class="auth-field" id="fieldPass"> <label class="auth-field-label" for="authPassword" data-i18n="passwordLabel">Password</label> <div class="pw-wrap"> <input type="password" id="authPassword" name="password" data-i18n-placeholder="passwordPlaceholder" placeholder="Enter your password" autocomplete="current-password" enterkeyhint="go" aria-describedby="hintPass"> <button type="button" class="pw-toggle" id="pwToggle" aria-pressed="false"><i class="fas fa-eye"></i></button> </div> <div class="pw-meter" id="pwMeter" data-level="0" hidden><i></i><i></i><i></i></div> <div class="auth-hint" id="hintPass"></div> </div> <div class="auth-field" id="fieldConfirm" hidden> <label class="auth-field-label" for="authConfirm" data-i18n="confirmLabel">Confirm password</label> <input type="password" id="authConfirm" name="confirm" data-i18n-placeholder="confirmPlaceholder" placeholder="Re-enter your password" autocomplete="new-password" enterkeyhint="go" aria-describedby="hintConfirm"> <div class="auth-hint" id="hintConfirm"></div> </div> <div class="auth-buttons"> <button type="submit" id="authSubmit"><span id="authSubmitLabel"></span></button> </div> <div id="authError" role="alert" aria-live="assertive"></div> </form> <p class="auth-switch"><span id="authSwitchText"></span> <button type="button" class="auth-link" id="authSwitch"></button></p> <div class="auth-lang-row"> <div class="lang-toggle" id="authLangToggle" data-lang="en"> <div class="lang-toggle-slider"></div> <button type="button" data-lang-btn="en" class="active">EN</button> <button type="button" data-lang-btn="fa">FA</button> </div> </div> <div class="footer-bottom"> <span data-i18n="footCreated">Created with</span> <span class="heart" role="img" aria-label="love">❤️</span> <span>&amp;</span> <span class="coffee" role="img" aria-label="coffee">☕</span> <span data-i18n="footBy">by</span> <span class="credit-name">Hossein Seyed Bagheri</span> <a class="github-link" href="https://github.com/hosseinb1111/cloudflare-based-AI" target="_blank" rel="noopener noreferrer" aria-label="View project on GitHub" title="View on GitHub"> <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg> </a> </div> </div> </div>
 
 <!-- MAIN APP (hidden until authenticated) -->
 
@@ -2802,11 +2857,11 @@ html[dir="rtl"] .copy-code-btn { right: auto; left: 6px; }
 <div class="mem-toast" id="memoryToast"><span id="memoryToastText"></span><button id="memoryToastUndo" style="display:none;">Undo</button></div>
 <div class="mem-toast" id="webSearchToast"><span id="webSearchToastText"></span></div>
 
-<script> // ---------- AUTH SETUP ---------- const authScreen = document.getElementById('authScreen'); const appContainer = document.getElementById('appContainer'); const authUsername = document.getElementById('authUsername'); const authPassword = document.getElementById('authPassword'); const authError = document.getElementById('authError'); const continueBtn = document.getElementById('continueBtn'); const usernameDisplay = document.getElementById('usernameDisplay'); const logoutBtn = document.getElementById('logoutBtn');
+<script> // ---------- AUTH SETUP ---------- const authScreen = document.getElementById('authScreen'); const appContainer = document.getElementById('appContainer'); const authUsername = document.getElementById('authUsername'); const authPassword = document.getElementById('authPassword'); const authError = document.getElementById('authError'); const authSubmit = document.getElementById('authSubmit'); const usernameDisplay = document.getElementById('usernameDisplay'); const logoutBtn = document.getElementById('logoutBtn');
 
 const translations = {
   en: {
-    authTitle: "System Authentication", authSubtitle: "Welcome back", usernameLabel: "Username", usernamePlaceholder: "Enter your username",
+    authTitle: "System Authentication", tabLogin: "Log in", tabSignup: "Sign up", subLogin: "Welcome back. Log in to pick up your chats.", subSignup: "Create an account to save your chats and memory.", btnLogin: "Log in", btnSignup: "Create account", busyLogin: "Logging in...", busySignup: "Creating account...", confirmLabel: "Confirm password", confirmPlaceholder: "Re-enter your password", switchToSignupText: "New here?", switchToSignupBtn: "Create an account", switchToLoginText: "Already have an account?", switchToLoginBtn: "Log in", hintUser: "3-32 characters: letters, numbers, . _ -", hintPass: "At least 6 characters. Longer is stronger.", pwWeak: "Weak", pwOk: "Good", pwStrong: "Strong", errUserEmpty: "Enter your username", errUserFormat: "Use 3-32 letters, numbers, . _ or -", errPassEmpty: "Enter your password", errPassShort: "Use at least 6 characters", errMatch: "Passwords don't match", errTaken: "That username is taken. Try another, or log in.", errBadCreds: "Wrong username or password. New here? Choose Sign up.", errRate: "Too many attempts. Wait a bit and try again.", showPw: "Show password", hidePw: "Hide password", footCreated: "Created with", footBy: "by", authSubtitle: "Welcome back", usernameLabel: "Username", usernamePlaceholder: "Enter your username",
     passwordLabel: "Password", passwordPlaceholder: "Enter your password", continueBtn: "Continue", errFillFields: "Please fill in all fields",
     errAuthFailed: "Authentication failed", errNetwork: "Network error. Please try again.", brandName: "System_AI", sessions: "Sessions",
     newChat: "Initialize", logout: "Logout", send: "Send", uploadImage: "Upload image", copy: "Copy", retry: "Retry", delete: "Delete",
@@ -2828,7 +2883,7 @@ const translations = {
     webSearchToggle: "Web search", searchingWeb: "Searching the web", reconnecting: "Reconnecting… finishing your last answer",
   },
   fa: {
-    authTitle: "احراز هویت سیستم", authSubtitle: "خوش برگشتید", usernameLabel: "نام کاربری", usernamePlaceholder: "نام کاربری خود را وارد کنید",
+    authTitle: "احراز هویت سیستم", tabLogin: "ورود", tabSignup: "ثبت‌نام", subLogin: "خوش آمدید. وارد شوید تا گفتگوهایتان را ادامه دهید.", subSignup: "حساب بسازید تا گفتگوها و حافظه‌تان ذخیره شود.", btnLogin: "ورود", btnSignup: "ساخت حساب", busyLogin: "در حال ورود...", busySignup: "در حال ساخت حساب...", confirmLabel: "تکرار رمز عبور", confirmPlaceholder: "رمز عبور را دوباره وارد کنید", switchToSignupText: "تازه آمده‌اید؟", switchToSignupBtn: "ساخت حساب", switchToLoginText: "حساب دارید؟", switchToLoginBtn: "ورود", hintUser: "۳ تا ۳۲ نویسه: حروف انگلیسی، عدد، . _ -", hintPass: "حداقل ۶ نویسه. هرچه بلندتر، امن‌تر.", pwWeak: "ضعیف", pwOk: "خوب", pwStrong: "قوی", errUserEmpty: "نام کاربری را وارد کنید", errUserFormat: "۳ تا ۳۲ نویسه از حروف انگلیسی، عدد، . _ یا - استفاده کنید", errPassEmpty: "رمز عبور را وارد کنید", errPassShort: "حداقل ۶ نویسه وارد کنید", errMatch: "رمزها یکسان نیستند", errTaken: "این نام کاربری گرفته شده است. نام دیگری انتخاب کنید یا وارد شوید.", errBadCreds: "نام کاربری یا رمز عبور اشتباه است. تازه آمده‌اید؟ ثبت‌نام را بزنید.", errRate: "تلاش‌های زیاد. کمی صبر کنید و دوباره امتحان کنید.", showPw: "نمایش رمز عبور", hidePw: "پنهان کردن رمز", footCreated: "ساخته شده با", footBy: "توسط", authSubtitle: "خوش برگشتید", usernameLabel: "نام کاربری", usernamePlaceholder: "نام کاربری خود را وارد کنید",
     passwordLabel: "رمز عبور", passwordPlaceholder: "رمز عبور خود را وارد کنید", continueBtn: "ادامه", errFillFields: "لطفاً همه فیلدها را پر کنید",
     errAuthFailed: "احراز هویت ناموفق بود", errNetwork: "خطای شبکه. لطفاً دوباره تلاش کنید.", brandName: "System_AI", sessions: "نشست‌ها",
     newChat: "گفتگوی جدید", logout: "خروج", send: "ارسال", uploadImage: "بارگذاری تصویر", copy: "کپی", retry: "تلاش مجدد", delete: "حذف",
@@ -2913,32 +2968,122 @@ logoutBtn.addEventListener('click', logout);
 if (!token || !username) { authScreen.style.display = 'flex'; appContainer.style.display = 'none'; }
 else { authScreen.style.display = 'none'; appContainer.style.display = 'flex'; usernameDisplay.textContent = username; initApp(); }
 
-async function handleContinue() {
-  const u = authUsername.value.trim(); const p = authPassword.value.trim();
-  if (!u || !p) { authError.textContent = t('errFillFields'); return; }
-  authError.textContent = ''; continueBtn.disabled = true;
+let authMode = 'login', authBusy = false;
+const USER_RE = /^[a-zA-Z0-9_.-]{3,32}$/;
+const $a = (id) => document.getElementById(id);
+const authForm = $a('authForm'), authConfirm = $a('authConfirm'), pwToggle = $a('pwToggle'), pwMeter = $a('pwMeter');
+const fields = { user: [$a('fieldUser'), $a('hintUser'), authUsername], pass: [$a('fieldPass'), $a('hintPass'), authPassword], confirm: [$a('fieldConfirm'), $a('hintConfirm'), authConfirm] };
+const touched = { user: false, pass: false, confirm: false };
+
+function pwScore(p) {
+  const lo = /[a-z]/.test(p), up = /[A-Z]/.test(p), num = /[0-9]/.test(p);
+  if (p.length >= 12 && lo && up && num) return 3;
+  if (p.length >= 10 && lo && (up || num)) return 2;
+  return p.length >= 6 ? 1 : 0;
+}
+function fieldValue(k) { return fields[k][2].value.trim(); }
+function fieldError(k) {
+  const v = fieldValue(k);
+  if (k === 'user') return !v ? 'errUserEmpty' : (authMode === 'signup' && !USER_RE.test(v) ? 'errUserFormat' : '');
+  if (k === 'pass') return !v ? 'errPassEmpty' : (authMode === 'signup' && v.length < 6 ? 'errPassShort' : '');
+  return v !== fieldValue('pass') ? 'errMatch' : '';
+}
+function paintField(k, show) {
+  const [box, hint] = fields[k]; const err = fieldError(k); const v = fieldValue(k);
+  const showErr = (show || touched[k]) && err;
+  let msg = '';
+  if (showErr) msg = t(err);
+  else if (authMode === 'signup' && k === 'user') msg = t('hintUser');
+  else if (authMode === 'signup' && k === 'pass') msg = v ? t(['', 'pwWeak', 'pwOk', 'pwStrong'][pwScore(v)] || 'pwWeak') : t('hintPass');
+  box.classList.toggle('invalid', !!showErr);
+  box.classList.toggle('valid', !err && !!v && authMode === 'signup');
+  hint.textContent = msg;
+  if (k === 'pass') { pwMeter.dataset.level = String(v ? pwScore(v) : 0); }
+  return err;
+}
+function renderAuthMode() {
+  const login = authMode === 'login';
+  [['tabLogin', 'login'], ['tabSignup', 'signup']].forEach(([id, m]) => { const b = $a(id); b.setAttribute('aria-selected', String(m === authMode)); b.tabIndex = m === authMode ? 0 : -1; });
+  $a('authSubtitle').textContent = t(login ? 'subLogin' : 'subSignup');
+  $a('authSubmitLabel').textContent = t(authBusy ? (login ? 'busyLogin' : 'busySignup') : (login ? 'btnLogin' : 'btnSignup'));
+  $a('authSwitchText').textContent = t(login ? 'switchToSignupText' : 'switchToLoginText');
+  $a('authSwitch').textContent = t(login ? 'switchToSignupBtn' : 'switchToLoginBtn');
+  fields.confirm[0].hidden = login; pwMeter.hidden = login;
+  authPassword.setAttribute('autocomplete', login ? 'current-password' : 'new-password');
+  const shown = authPassword.type === 'text';
+  pwToggle.setAttribute('aria-label', t(shown ? 'hidePw' : 'showPw'));
+  Object.keys(fields).forEach((k) => paintField(k, false));
+}
+function setMode(m) {
+  if (authBusy || m === authMode) return;
+  authMode = m; authError.textContent = '';
+  touched.user = touched.pass = touched.confirm = false; authConfirm.value = '';
+  renderAuthMode();
+}
+function setBusy(b) {
+  authBusy = b; authSubmit.disabled = b; authSubmit.classList.toggle('busy', b);
+  authSubmit.setAttribute('aria-busy', String(b));
+  Object.values(fields).forEach((f) => { f[2].disabled = b; });
+  renderAuthMode();
+}
+function authErrorText(status, data) {
+  if (status === 401) return t('errBadCreds');
+  if (status === 409) return t('errTaken');
+  if (status === 429) return (data && data.error) || t('errRate');
+  return (data && data.error) || t('errAuthFailed');
+}
+document.querySelectorAll('.auth-tab').forEach((b) => {
+  b.addEventListener('click', () => setMode(b.dataset.mode));
+  b.addEventListener('keydown', (e) => {
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+    e.preventDefault(); const next = authMode === 'login' ? 'signup' : 'login'; setMode(next); $a(next === 'login' ? 'tabLogin' : 'tabSignup').focus();
+  });
+});
+$a('authSwitch').addEventListener('click', () => setMode(authMode === 'login' ? 'signup' : 'login'));
+Object.keys(fields).forEach((k) => {
+  const el = fields[k][2];
+  el.addEventListener('blur', () => { if (el.value) touched[k] = true; paintField(k, false); });
+  el.addEventListener('input', () => {
+    authError.textContent = '';
+    paintField(k, false);
+    if (k === 'pass' && touched.confirm) paintField('confirm', false);
+  });
+});
+pwToggle.addEventListener('click', () => {
+  const show = authPassword.type === 'password';
+  [authPassword, authConfirm].forEach((i) => { i.type = show ? 'text' : 'password'; });
+  pwToggle.setAttribute('aria-pressed', String(show));
+  pwToggle.firstElementChild.className = show ? 'fas fa-eye-slash' : 'fas fa-eye';
+  pwToggle.setAttribute('aria-label', t(show ? 'hidePw' : 'showPw'));
+});
+authForm.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  if (authBusy) return;
+  const keys = authMode === 'signup' ? ['user', 'pass', 'confirm'] : ['user', 'pass'];
+  keys.forEach((k) => { touched[k] = true; });
+  const bad = keys.filter((k) => paintField(k, true));
+  if (bad.length) { fields[bad[0]][2].focus(); return; }
+  const u = fieldValue('user'), p = fieldValue('pass');
+  authError.textContent = ''; setBusy(true);
   try {
-    let res = await fetch('/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: u, password: p }) });
-    let data = await res.json();
+    const res = await fetch(authMode === 'login' ? '/api/login' : '/api/signup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: u, password: p }) });
+    let data = {}; try { data = await res.json(); } catch (_) {}
     if (!res.ok) {
-      const looksMissing = res.status === 401 || /invalid credentials/i.test(data.error || '');
-      if (looksMissing) {
-        const signupRes = await fetch('/api/signup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: u, password: p }) });
-        const signupData = await signupRes.json();
-        if (!signupRes.ok) { authError.textContent = signupData.error || data.error || t('errAuthFailed'); return; }
-        res = signupRes; data = signupData;
-      } else { authError.textContent = data.error || t('errAuthFailed'); return; }
+      authError.textContent = authErrorText(res.status, data);
+      if (res.status === 409) authUsername.focus();
+      return;
     }
     token = data.token; username = u;
     localStorage.setItem('token', token); localStorage.setItem('username', username);
+    authPassword.value = ''; authConfirm.value = ''; touched.user = touched.pass = touched.confirm = false;
     authScreen.style.display = 'none'; appContainer.style.display = 'flex';
     usernameDisplay.textContent = username; initApp();
   } catch (err) { authError.textContent = t('errNetwork'); }
-  finally { continueBtn.disabled = false; }
-}
-continueBtn.addEventListener('click', handleContinue);
-authPassword.addEventListener('keydown', (e) => { if (e.key === 'Enter') handleContinue(); });
-authUsername.addEventListener('keydown', (e) => { if (e.key === 'Enter') authPassword.focus(); });
+  finally { setBusy(false); }
+});
+const _applyTranslationsBase = applyTranslations;
+applyTranslations = function () { _applyTranslationsBase(); renderAuthMode(); };
+renderAuthMode();
 
 const html = document.documentElement;
 const storedTheme = localStorage.getItem('theme');
